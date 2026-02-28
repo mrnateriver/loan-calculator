@@ -225,11 +225,9 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
 
             let interest_payment = regular_interest + arrears_interest_signed;
             let mut principal_payment = monthly_payment_base - regular_interest;
-            let mut actual_payment = monthly_payment_base + arrears_interest_signed;
 
             if month == total_months || principal_payment > remaining_principal {
                 principal_payment = remaining_principal;
-                actual_payment = principal_payment + interest_payment;
             }
 
             remaining_principal -= principal_payment;
@@ -238,20 +236,24 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
             }
 
             let fees_payment = input.monthly_fees;
-            let mut principal_payment_for_schedule = principal_payment;
-            let mut total_payment = actual_payment + fees_payment;
-            if input.round_monthly_payment_up {
-                let rounded_total = total_payment.ceil();
-                principal_payment_for_schedule += rounded_total - total_payment;
-                total_payment = rounded_total;
-            }
+            let (interest_payment_for_schedule, principal_payment_for_schedule) =
+                if input.round_monthly_payment_up {
+                    (
+                        round_half_up(interest_payment),
+                        round_half_up(principal_payment),
+                    )
+                } else {
+                    (interest_payment, principal_payment)
+                };
+            let total_payment =
+                interest_payment_for_schedule + principal_payment_for_schedule + fees_payment;
 
             repayment_schedule.push(RepaymentScheduleEntry {
                 month_index: month,
                 payment_date,
                 effective_annual_interest_rate_pct: *annual_rate_pct,
                 total_payment,
-                interest_payment,
+                interest_payment: interest_payment_for_schedule,
                 principal_payment: principal_payment_for_schedule,
                 fees_payment,
             });
@@ -398,6 +400,10 @@ fn compute_monthly_payment(principal: f64, annual_rate_pct: f64, remaining_month
     let months = remaining_months as f64;
     let growth = (1.0 + monthly_rate).powf(months);
     principal * monthly_rate * growth / (growth - 1.0)
+}
+
+fn round_half_up(value: f64) -> f64 {
+    value.round()
 }
 
 fn validate_non_negative(field: &'static str, value: f64) -> Result<(), CalcError> {

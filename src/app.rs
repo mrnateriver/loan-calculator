@@ -41,7 +41,7 @@ impl FieldId {
             FieldId::TermYears => "Term (years)",
             FieldId::StartDate => "Start Date (YYYY-MM-DD)",
             FieldId::PaymentDay => "Payment Day (1-31)",
-            FieldId::RoundPaymentsUp => "Round Payment Up To Integer",
+            FieldId::RoundPaymentsUp => "Round Payment To Nearest Integer",
         }
     }
 

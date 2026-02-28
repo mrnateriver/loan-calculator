@@ -107,13 +107,14 @@ fn first_payment_uses_regular_principal_plus_arrears_interest_surcharge() {
         .expect("schedule should include first payment");
     let second = &metrics.repayment_schedule[1];
 
+    assert_relative_eq!(first.interest_payment, 19_920.0, epsilon = 1e-9);
+    assert_relative_eq!(first.principal_payment, 5_083.0, epsilon = 1e-9);
+    assert_relative_eq!(first.total_payment, 25_063.0, epsilon = 1e-9);
     assert_relative_eq!(
-        first.interest_payment,
-        19_920.004_997_260_276,
-        epsilon = 1e-6
+        first.total_payment,
+        first.interest_payment + first.principal_payment + first.fees_payment,
+        epsilon = 1e-9
     );
-    assert_relative_eq!(first.principal_payment, 5_084.0, epsilon = 1e-2);
-    assert_relative_eq!(first.total_payment, 25_064.0, epsilon = 1e-9);
     assert!(first.total_payment > second.total_payment);
 }
 
@@ -397,20 +398,29 @@ fn repayment_schedule_rows_sum_to_totals() {
 }
 
 #[test]
-fn rounded_monthly_payments_are_ceiled_and_totals_follow_schedule_sum() {
+fn rounded_mode_rounds_interest_and_principal_and_totals_follow_schedule_sum() {
     let mut rounded_input = sample_input();
     rounded_input.round_monthly_payment_up = true;
 
-    let unrounded =
-        calculate_metrics(&sample_input(), 1).expect("baseline calculation should succeed");
     let rounded = calculate_metrics(&rounded_input, 1).expect("rounded calculation should succeed");
 
     assert!(
         rounded
             .repayment_schedule
             .iter()
-            .all(|row| row.total_payment.fract().abs() < 1e-9)
+            .all(|row| row.interest_payment.fract().abs() < 1e-9)
     );
+    assert!(
+        rounded
+            .repayment_schedule
+            .iter()
+            .all(|row| row.principal_payment.fract().abs() < 1e-9)
+    );
+    assert!(rounded.repayment_schedule.iter().all(|row| {
+        (row.total_payment - (row.interest_payment + row.principal_payment + row.fees_payment))
+            .abs()
+            < 1e-9
+    }));
 
     let rounded_total_paid: f64 = rounded
         .repayment_schedule
@@ -422,6 +432,11 @@ fn rounded_monthly_payments_are_ceiled_and_totals_follow_schedule_sum() {
         .iter()
         .map(|row| row.fees_payment)
         .sum();
+    let rounded_total_interest: f64 = rounded
+        .repayment_schedule
+        .iter()
+        .map(|row| row.interest_payment)
+        .sum();
 
     assert_relative_eq!(rounded.total_repayment, rounded_total_paid, epsilon = 1e-9);
     assert_relative_eq!(
@@ -429,7 +444,11 @@ fn rounded_monthly_payments_are_ceiled_and_totals_follow_schedule_sum() {
         rounded_total_fees,
         epsilon = 1e-9
     );
-    assert!(rounded.total_repayment > unrounded.total_repayment);
+    assert_relative_eq!(
+        rounded.total_interest,
+        rounded_total_interest,
+        epsilon = 1e-9
+    );
     assert_relative_eq!(
         rounded.loan_cost,
         rounded.total_paid_all_in - rounded_input.loan_amount,
