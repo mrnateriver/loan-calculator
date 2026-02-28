@@ -76,7 +76,10 @@ fn render_form(frame: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .title(" Inputs ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(panel_border_style(
+                    Color::Cyan,
+                    !app.is_schedule_focused(),
+                )),
         )
         .wrap(Wrap { trim: false });
 
@@ -105,7 +108,10 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
     let schedule_block = Block::default()
         .title(" Repayment Schedule ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Blue));
+        .border_style(panel_border_style(
+            Color::Blue,
+            app.is_schedule_focused(),
+        ));
 
     let inner = schedule_block.inner(area);
     frame.render_widget(schedule_block, area);
@@ -333,6 +339,16 @@ fn money(value: f64) -> String {
 
 fn format_rate(value: f64) -> String {
     format!("{value:.3}")
+}
+
+fn panel_border_style(base_color: Color, is_active: bool) -> Style {
+    if is_active {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(base_color)
+    }
 }
 
 fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
