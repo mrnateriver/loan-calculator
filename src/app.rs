@@ -2,11 +2,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     time::{SystemTime, UNIX_EPOCH},
 };
+#[cfg(not(test))]
+use std::fs;
 
 use crate::model::{DateYmd, LoanInput, LoanMetrics, RateOverride, calculate_metrics};
 
 const TEXT_FIELD_COUNT: usize = 7;
 const FIELD_COUNT: usize = 8;
+#[cfg(not(test))]
+const STATE_FILE_PATH: &str = ".loan-calculator.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldId {
@@ -155,6 +159,7 @@ impl Default for App {
             schedule_viewport_rows: 1,
             rate_overrides: BTreeMap::new(),
         };
+        app.restore_state_from_disk_silently();
         app.recalculate();
         app
     }
@@ -364,6 +369,7 @@ impl App {
         }
 
         self.inputs[active.index()].push(c);
+        self.persist_state_silently();
     }
 
     pub fn backspace(&mut self) {
@@ -372,10 +378,12 @@ impl App {
         }
 
         self.inputs[self.active_field().index()].pop();
+        self.persist_state_silently();
     }
 
     pub fn toggle_round_payments_up(&mut self) {
         self.round_payments_up = !self.round_payments_up;
+        self.persist_state_silently();
         self.recalculate();
     }
 
@@ -394,6 +402,7 @@ impl App {
         self.schedule_selected_index = 0;
         self.schedule_scroll_offset = 0;
         self.rate_overrides.clear();
+        self.persist_state_silently();
         self.recalculate();
     }
 
@@ -496,6 +505,7 @@ impl App {
             Ok(parsed) if parsed.is_finite() && parsed >= 0.0 => {
                 self.rate_overrides.insert(date, parsed);
                 self.error = None;
+                self.persist_state_silently();
                 self.recalculate();
                 self.select_schedule_row_by_date(date, true);
                 self.is_row_rate_popup_open = false;
@@ -517,6 +527,7 @@ impl App {
 
         self.rate_overrides.remove(&date);
         self.error = None;
+        self.persist_state_silently();
         self.recalculate();
         self.select_schedule_row_by_date(date, false);
         self.is_row_rate_popup_open = false;
@@ -787,6 +798,118 @@ impl App {
         Some((start_date, last_payment_date))
     }
 
+    fn restore_state_from_disk_silently(&mut self) {
+        #[cfg(test)]
+        {
+            return;
+        }
+
+        #[cfg(not(test))]
+        {
+            let Ok(raw_state) = fs::read_to_string(STATE_FILE_PATH) else {
+                return;
+            };
+
+            let mut restored_inputs = self.inputs.clone();
+            if let Some(value) = extract_json_string_value(&raw_state, "loan_amount") {
+                restored_inputs[FieldId::LoanAmount.index()] = value;
+            }
+            if let Some(value) = extract_json_string_value(&raw_state, "one_time_fees") {
+                restored_inputs[FieldId::OneTimeFees.index()] = value;
+            }
+            if let Some(value) = extract_json_string_value(&raw_state, "monthly_fees") {
+                restored_inputs[FieldId::MonthlyFees.index()] = value;
+            }
+            if let Some(value) = extract_json_string_value(&raw_state, "interest_rate") {
+                restored_inputs[FieldId::InterestRate.index()] = value;
+            }
+            if let Some(value) = extract_json_string_value(&raw_state, "term_years") {
+                restored_inputs[FieldId::TermYears.index()] = value;
+            }
+            if let Some(value) = extract_json_string_value(&raw_state, "start_date") {
+                restored_inputs[FieldId::StartDate.index()] = value;
+            }
+            if let Some(value) = extract_json_string_value(&raw_state, "payment_day") {
+                restored_inputs[FieldId::PaymentDay.index()] = value;
+            }
+
+            self.inputs = restored_inputs;
+
+            if let Some(round_flag) = extract_json_bool_value(&raw_state, "round_payments_up") {
+                self.round_payments_up = round_flag;
+            }
+
+            if let Some(overrides_obj) = extract_json_object_value(&raw_state, "rate_overrides") {
+                self.rate_overrides = parse_override_map_json(overrides_obj);
+            }
+        }
+    }
+
+    fn persist_state_silently(&self) {
+        #[cfg(test)]
+        {
+            return;
+        }
+
+        #[cfg(not(test))]
+        {
+            let serialized = self.to_persisted_state_json();
+            let _ = fs::write(STATE_FILE_PATH, serialized);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn to_persisted_state_json(&self) -> String {
+        let mut json = String::from("{\n");
+        json.push_str(&format!(
+            "  \"loan_amount\": \"{}\",\n",
+            escape_json_string(self.field_value(FieldId::LoanAmount))
+        ));
+        json.push_str(&format!(
+            "  \"one_time_fees\": \"{}\",\n",
+            escape_json_string(self.field_value(FieldId::OneTimeFees))
+        ));
+        json.push_str(&format!(
+            "  \"monthly_fees\": \"{}\",\n",
+            escape_json_string(self.field_value(FieldId::MonthlyFees))
+        ));
+        json.push_str(&format!(
+            "  \"interest_rate\": \"{}\",\n",
+            escape_json_string(self.field_value(FieldId::InterestRate))
+        ));
+        json.push_str(&format!(
+            "  \"term_years\": \"{}\",\n",
+            escape_json_string(self.field_value(FieldId::TermYears))
+        ));
+        json.push_str(&format!(
+            "  \"start_date\": \"{}\",\n",
+            escape_json_string(self.field_value(FieldId::StartDate))
+        ));
+        json.push_str(&format!(
+            "  \"payment_day\": \"{}\",\n",
+            escape_json_string(self.field_value(FieldId::PaymentDay))
+        ));
+        json.push_str(&format!(
+            "  \"round_payments_up\": {},\n",
+            if self.round_payments_up {
+                "true"
+            } else {
+                "false"
+            }
+        ));
+        json.push_str("  \"rate_overrides\": {\n");
+
+        let override_len = self.rate_overrides.len();
+        for (idx, (date, apr)) in self.rate_overrides.iter().enumerate() {
+            let comma = if idx + 1 == override_len { "" } else { "," };
+            json.push_str(&format!("    \"{}\": {}{}\n", date, apr, comma));
+        }
+
+        json.push_str("  }\n");
+        json.push('}');
+        json
+    }
+
     fn term_months_from_input(&self) -> Option<u32> {
         let years = parse_u32(FieldId::TermYears, self.field_value(FieldId::TermYears)).ok()?;
         if years == 0 {
@@ -894,6 +1017,156 @@ fn parse_date_input_for_override(value: &str) -> Result<DateYmd, String> {
 
     DateYmd::parse_yyyy_mm_dd(trimmed)
         .ok_or_else(|| "Rate override effective date must be in YYYY-MM-DD format".to_string())
+}
+
+#[cfg(not(test))]
+fn escape_json_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+#[cfg(not(test))]
+fn extract_json_string_value(content: &str, key: &str) -> Option<String> {
+    let key_pattern = format!("\"{key}\"");
+    let key_start = content.find(&key_pattern)?;
+    let after_key = &content[key_start + key_pattern.len()..];
+    let colon_idx = after_key.find(':')?;
+    let mut value_part = &after_key[colon_idx + 1..];
+    value_part = value_part.trim_start();
+    if !value_part.starts_with('"') {
+        return None;
+    }
+
+    let mut result = String::new();
+    let mut escaped = false;
+    for ch in value_part[1..].chars() {
+        if escaped {
+            match ch {
+                'n' => result.push('\n'),
+                'r' => result.push('\r'),
+                't' => result.push('\t'),
+                '"' => result.push('"'),
+                '\\' => result.push('\\'),
+                other => result.push(other),
+            }
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            return Some(result);
+        }
+        result.push(ch);
+    }
+
+    None
+}
+
+#[cfg(not(test))]
+fn extract_json_bool_value(content: &str, key: &str) -> Option<bool> {
+    let key_pattern = format!("\"{key}\"");
+    let key_start = content.find(&key_pattern)?;
+    let after_key = &content[key_start + key_pattern.len()..];
+    let colon_idx = after_key.find(':')?;
+    let value_part = after_key[colon_idx + 1..].trim_start();
+
+    if value_part.starts_with("true") {
+        Some(true)
+    } else if value_part.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(test))]
+fn extract_json_object_value<'a>(content: &'a str, key: &str) -> Option<&'a str> {
+    let key_pattern = format!("\"{key}\"");
+    let key_start = content.find(&key_pattern)?;
+    let after_key = &content[key_start + key_pattern.len()..];
+    let colon_idx = after_key.find(':')?;
+    let value_part = after_key[colon_idx + 1..].trim_start();
+    let open_idx = value_part.find('{')?;
+
+    let mut depth = 0usize;
+    let mut end_idx = None;
+    for (idx, ch) in value_part[open_idx..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    end_idx = Some(open_idx + idx + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let end_idx = end_idx?;
+    Some(&value_part[open_idx..end_idx])
+}
+
+#[cfg(not(test))]
+fn parse_override_map_json(raw_object: &str) -> BTreeMap<DateYmd, f64> {
+    let mut map = BTreeMap::new();
+    let Some(open_brace) = raw_object.find('{') else {
+        return map;
+    };
+    let Some(close_brace) = raw_object.rfind('}') else {
+        return map;
+    };
+    if close_brace <= open_brace {
+        return map;
+    }
+
+    let body = &raw_object[open_brace + 1..close_brace];
+    for raw_entry in body.split(',') {
+        let entry = raw_entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+
+        let Some(colon_idx) = entry.find(':') else {
+            continue;
+        };
+        let raw_key = entry[..colon_idx].trim();
+        let raw_value = entry[colon_idx + 1..].trim();
+        if raw_key.len() < 2 || !raw_key.starts_with('"') || !raw_key.ends_with('"') {
+            continue;
+        }
+
+        let date_str = &raw_key[1..raw_key.len() - 1];
+        let Some(date) = DateYmd::parse_yyyy_mm_dd(date_str) else {
+            continue;
+        };
+
+        let Ok(apr) = raw_value.parse::<f64>() else {
+            continue;
+        };
+        if !apr.is_finite() || apr < 0.0 {
+            continue;
+        }
+
+        map.insert(date, apr);
+    }
+
+    map
 }
 
 fn format_rate_for_input(value: f64) -> String {
