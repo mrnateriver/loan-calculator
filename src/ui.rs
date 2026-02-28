@@ -42,9 +42,7 @@ fn render_form(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::with_capacity(FieldId::ALL.len() + 5);
 
     for field in FieldId::ALL {
-        let is_active = field == app.active_field()
-            && !app.is_row_rate_popup_open
-            && !app.is_schedule_focused();
+        let is_active = field == app.active_field() && !app.is_row_rate_popup_open;
         let marker = if is_active { ">" } else { " " };
         let value = app.field_display_value(field);
 
@@ -71,14 +69,6 @@ fn render_form(frame: &mut Frame, app: &App, area: Rect) {
         "Selected Row Month: M{} ({})",
         app.selected_month,
         app.format_schedule_month(app.selected_month)
-    )));
-    lines.push(Line::from(format!(
-        "Focus: {}",
-        if app.is_schedule_focused() {
-            "Schedule"
-        } else {
-            "Inputs"
-        }
     )));
 
     let form = Paragraph::new(Text::from(lines))
@@ -112,17 +102,10 @@ fn render_summary(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
-    let is_schedule_active = app.is_schedule_focused() && !app.is_row_rate_popup_open;
-    let border_color = if is_schedule_active {
-        Color::Yellow
-    } else {
-        Color::Blue
-    };
-
     let schedule_block = Block::default()
         .title(" Repayment Schedule ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(Color::Blue));
 
     let inner = schedule_block.inner(area);
     frame.render_widget(schedule_block, area);
@@ -149,8 +132,8 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
 
         lines.push(Line::styled(
             format!(
-                "{:<8} {:>8} {:>12} {:>12} {:>12} {:>10}",
-                "Month", "APR(%)", "Payment", "Interest", "Principal", "Fees"
+                "{:<8} {:<10} {:>8} {:>12} {:>12} {:>12} {:>10}",
+                "Month", "Date", "APR(%)", "Payment", "Interest", "Principal", "Fees"
             ),
             Style::default()
                 .fg(Color::Cyan)
@@ -160,9 +143,12 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
         for (visible_idx, entry) in metrics.repayment_schedule[offset..end].iter().enumerate() {
             let absolute_idx = offset + visible_idx;
             let is_selected = absolute_idx == app.schedule_selected_index;
+            let month_label = entry.payment_date.format_yyyy_mm();
+            let date_label = entry.payment_date.format_yyyy_mm_dd();
             let line = format!(
-                "{:<8} {:>8} {:>12} {:>12} {:>12} {:>10}",
-                app.format_schedule_month(entry.month_index),
+                "{:<8} {:<10} {:>8} {:>12} {:>12} {:>12} {:>10}",
+                month_label,
+                date_label,
                 format_rate(entry.effective_annual_interest_rate_pct),
                 money(entry.total_payment),
                 money(entry.interest_payment),
@@ -239,6 +225,12 @@ fn render_row_rate_popup(frame: &mut Frame, app: &App) {
 
     let selected_month = app.selected_month;
     let selected_month_label = app.format_schedule_month(selected_month);
+    let selected_payment_date = app
+        .metrics
+        .as_ref()
+        .and_then(|metrics| metrics.repayment_schedule.get(app.schedule_selected_index))
+        .map(|entry| entry.payment_date.format_yyyy_mm_dd())
+        .unwrap_or_else(|| "--".to_string());
     let effective = app
         .metrics
         .as_ref()
@@ -265,6 +257,7 @@ fn render_row_rate_popup(frame: &mut Frame, app: &App) {
             "Selected Month: M{} ({selected_month_label})",
             selected_month
         )),
+        Line::from(format!("Payment Date:   {selected_payment_date}")),
         Line::from(format!("Effective APR:  {effective_display}%")),
         Line::from(format!("Override APR:   {override_display}%")),
         Line::from(""),

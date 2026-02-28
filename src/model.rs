@@ -2,6 +2,57 @@ use std::collections::BTreeMap;
 
 use thiserror::Error;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DateYmd {
+    pub year: i32,
+    pub month: u32,
+    pub day: u32,
+}
+
+impl DateYmd {
+    pub fn from_ymd_opt(year: i32, month: u32, day: u32) -> Option<Self> {
+        if !(1..=12).contains(&month) {
+            return None;
+        }
+
+        let last_day = last_day_of_month(year, month);
+        if day == 0 || day > last_day {
+            return None;
+        }
+
+        Some(Self { year, month, day })
+    }
+
+    pub fn parse_yyyy_mm_dd(value: &str) -> Option<Self> {
+        if value.len() != 10 {
+            return None;
+        }
+
+        let bytes = value.as_bytes();
+        if bytes[4] != b'-' || bytes[7] != b'-' {
+            return None;
+        }
+
+        let year = value[0..4].parse::<i32>().ok()?;
+        let month = value[5..7].parse::<u32>().ok()?;
+        let day = value[8..10].parse::<u32>().ok()?;
+
+        Self::from_ymd_opt(year, month, day)
+    }
+
+    pub fn format_yyyy_mm_dd(self) -> String {
+        format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
+    }
+
+    pub fn format_yyyy_mm(self) -> String {
+        format!("{:04}-{:02}", self.year, self.month)
+    }
+
+    pub fn days_since_epoch(self) -> i64 {
+        days_from_civil(self.year, self.month, self.day)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RateOverride {
     pub start_month: u32,
@@ -19,6 +70,7 @@ pub struct PaymentSegment {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RepaymentScheduleEntry {
     pub month_index: u32,
+    pub payment_date: DateYmd,
     pub effective_annual_interest_rate_pct: f64,
     pub total_payment: f64,
     pub interest_payment: f64,
@@ -34,6 +86,8 @@ pub struct LoanInput {
     pub round_monthly_payment_up: bool,
     pub base_annual_interest_rate_pct: f64,
     pub term_years: u32,
+    pub start_date: DateYmd,
+    pub payment_day: u32,
     pub rate_overrides: Vec<RateOverride>,
 }
 
@@ -65,6 +119,8 @@ pub enum CalcError {
     LoanAmountMustBePositive,
     #[error("term_years must be greater than 0")]
     TermYearsMustBePositive,
+    #[error("payment_day must be in range 1..=31")]
+    InvalidPaymentDay,
     #[error("rate override month {month} is out of range (1..={max_month})")]
     InvalidOverrideMonth { month: u32, max_month: u32 },
     #[error("duplicate rate override for month {0}")]
@@ -91,6 +147,10 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
         return Err(CalcError::TermYearsMustBePositive);
     }
 
+    if input.payment_day == 0 || input.payment_day > 31 {
+        return Err(CalcError::InvalidPaymentDay);
+    }
+
     let total_months = input.term_years.saturating_mul(12);
     if selected_month == 0 || selected_month > total_months {
         return Err(CalcError::InvalidSelectedMonth {
@@ -104,6 +164,18 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
         &input.rate_overrides,
         total_months,
     )?;
+
+    let payment_dates = build_payment_dates(input.start_date, input.payment_day, total_months);
+    let start_month_anchor_day = input.payment_day.min(last_day_of_month(
+        input.start_date.year,
+        input.start_date.month,
+    ));
+    let start_month_anchor = DateYmd::from_ymd_opt(
+        input.start_date.year,
+        input.start_date.month,
+        start_month_anchor_day,
+    )
+    .expect("start month anchor date must be valid");
 
     let mut remaining_principal = input.loan_amount;
     let mut segments = Vec::with_capacity(change_points.len());
@@ -127,12 +199,33 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
             monthly_payment_base,
         });
 
-        let monthly_rate = *annual_rate_pct / 100.0 / 12.0;
-
         for month in *start_month..=end_month {
-            let interest_payment = remaining_principal * monthly_rate;
-            let mut principal_payment = monthly_payment_base - interest_payment;
-            let mut actual_payment = monthly_payment_base;
+            let payment_date = payment_dates[(month - 1) as usize];
+            let regular_accrual_start = if month == 1 {
+                start_month_anchor
+            } else {
+                payment_dates[(month - 2) as usize]
+            };
+
+            let regular_accrual_days = (payment_date.days_since_epoch()
+                - regular_accrual_start.days_since_epoch())
+            .max(0) as f64;
+            let regular_interest =
+                remaining_principal * (*annual_rate_pct / 100.0) * (regular_accrual_days / 365.0);
+
+            let arrears_interest_signed = if month == 1 {
+                let arrears_days_signed =
+                    start_month_anchor.days_since_epoch() - input.start_date.days_since_epoch();
+                remaining_principal
+                    * (*annual_rate_pct / 100.0)
+                    * (arrears_days_signed as f64 / 365.0)
+            } else {
+                0.0
+            };
+
+            let interest_payment = regular_interest + arrears_interest_signed;
+            let mut principal_payment = monthly_payment_base - regular_interest;
+            let mut actual_payment = monthly_payment_base + arrears_interest_signed;
 
             if month == total_months || principal_payment > remaining_principal {
                 principal_payment = remaining_principal;
@@ -155,6 +248,7 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
 
             repayment_schedule.push(RepaymentScheduleEntry {
                 month_index: month,
+                payment_date,
                 effective_annual_interest_rate_pct: *annual_rate_pct,
                 total_payment,
                 interest_payment,
@@ -260,6 +354,40 @@ fn normalize_rate_overrides(
     Ok(change_points.into_iter().collect())
 }
 
+fn build_payment_dates(start_date: DateYmd, payment_day: u32, total_months: u32) -> Vec<DateYmd> {
+    let mut dates = Vec::with_capacity(total_months as usize);
+
+    for installment in 1..=total_months {
+        let (year, month) =
+            add_months_to_year_month(start_date.year, start_date.month, installment);
+        let day = payment_day.min(last_day_of_month(year, month));
+        let payment_date =
+            DateYmd::from_ymd_opt(year, month, day).expect("computed payment date must be valid");
+        dates.push(payment_date);
+    }
+
+    dates
+}
+
+fn add_months_to_year_month(year: i32, month: u32, delta_months: u32) -> (i32, u32) {
+    let total_months = year * 12 + (month as i32 - 1) + delta_months as i32;
+    let new_year = total_months.div_euclid(12);
+    let new_month = total_months.rem_euclid(12) + 1;
+    (new_year, new_month as u32)
+}
+
+fn last_day_of_month(year: i32, month: u32) -> u32 {
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+
+    let next_month_days = days_from_civil(next_year, next_month, 1);
+    let this_month_last_day = civil_from_days(next_month_days - 1);
+    this_month_last_day.2
+}
+
 fn compute_monthly_payment(principal: f64, annual_rate_pct: f64, remaining_months: u32) -> f64 {
     let monthly_rate = annual_rate_pct / 100.0 / 12.0;
 
@@ -278,4 +406,35 @@ fn validate_non_negative(field: &'static str, value: f64) -> Result<(), CalcErro
     }
 
     Ok(())
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+
+    (year as i32, month as u32, day as u32)
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let mut y = year as i64;
+    let m = month as i64;
+    let d = day as i64;
+
+    y -= if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }

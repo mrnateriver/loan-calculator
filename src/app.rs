@@ -3,10 +3,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::model::{LoanInput, LoanMetrics, RateOverride, calculate_metrics};
+use crate::model::{DateYmd, LoanInput, LoanMetrics, RateOverride, calculate_metrics};
 
-const NUMERIC_FIELD_COUNT: usize = 5;
-const FIELD_COUNT: usize = 6;
+const TEXT_FIELD_COUNT: usize = 7;
+const FIELD_COUNT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldId {
@@ -15,6 +15,8 @@ pub enum FieldId {
     MonthlyFees,
     InterestRate,
     TermYears,
+    StartDate,
+    PaymentDay,
     RoundPaymentsUp,
 }
 
@@ -25,6 +27,8 @@ impl FieldId {
         FieldId::MonthlyFees,
         FieldId::InterestRate,
         FieldId::TermYears,
+        FieldId::StartDate,
+        FieldId::PaymentDay,
         FieldId::RoundPaymentsUp,
     ];
 
@@ -35,15 +39,21 @@ impl FieldId {
             FieldId::MonthlyFees => "Monthly Fees",
             FieldId::InterestRate => "Base Interest Rate (% APR)",
             FieldId::TermYears => "Term (years)",
+            FieldId::StartDate => "Start Date (YYYY-MM-DD)",
+            FieldId::PaymentDay => "Payment Day (1-31)",
             FieldId::RoundPaymentsUp => "Round Payment Up To Integer",
         }
     }
 
     pub fn is_integer(self) -> bool {
-        matches!(self, FieldId::TermYears)
+        matches!(self, FieldId::TermYears | FieldId::PaymentDay)
     }
 
-    pub fn is_numeric_input(self) -> bool {
+    pub fn is_date(self) -> bool {
+        matches!(self, FieldId::StartDate)
+    }
+
+    pub fn is_text_input(self) -> bool {
         !matches!(self, FieldId::RoundPaymentsUp)
     }
 
@@ -54,8 +64,10 @@ impl FieldId {
             FieldId::MonthlyFees => 2,
             FieldId::InterestRate => 3,
             FieldId::TermYears => 4,
+            FieldId::StartDate => 5,
+            FieldId::PaymentDay => 6,
             FieldId::RoundPaymentsUp => {
-                unreachable!("checkbox field does not map to numeric input")
+                unreachable!("checkbox field does not map to text input")
             }
         }
     }
@@ -69,7 +81,7 @@ pub enum FocusArea {
 
 #[derive(Debug, Clone)]
 pub struct App {
-    pub inputs: [String; NUMERIC_FIELD_COUNT],
+    pub inputs: [String; TEXT_FIELD_COUNT],
     pub metrics: Option<LoanMetrics>,
     pub error: Option<String>,
     pub is_row_rate_popup_open: bool,
@@ -80,15 +92,12 @@ pub struct App {
     pub schedule_selected_index: usize,
     pub schedule_scroll_offset: usize,
     active_field_idx: usize,
-    schedule_start_year: i32,
-    schedule_start_month: u32,
     schedule_viewport_rows: usize,
     rate_overrides: BTreeMap<u32, f64>,
 }
 
 impl Default for App {
     fn default() -> Self {
-        let (schedule_start_year, schedule_start_month) = current_utc_year_month();
         let mut app = Self {
             inputs: default_inputs(),
             metrics: None,
@@ -101,8 +110,6 @@ impl Default for App {
             schedule_selected_index: 0,
             schedule_scroll_offset: 0,
             active_field_idx: 0,
-            schedule_start_year,
-            schedule_start_month,
             schedule_viewport_rows: 1,
             rate_overrides: BTreeMap::new(),
         };
@@ -117,10 +124,7 @@ impl App {
     }
 
     pub fn field_value(&self, field: FieldId) -> &str {
-        assert!(
-            field.is_numeric_input(),
-            "checkbox field has no string input"
-        );
+        assert!(field.is_text_input(), "checkbox field has no string input");
         &self.inputs[field.index()]
     }
 
@@ -258,18 +262,35 @@ impl App {
     }
 
     pub fn format_schedule_month(&self, month_index: u32) -> String {
-        let delta_months = month_index.saturating_sub(1) as i32;
-        let (year, month) = add_months(
-            self.schedule_start_year,
-            self.schedule_start_month,
-            delta_months,
-        );
+        if month_index == 0 {
+            return "---- --".to_string();
+        }
+
+        let Some(start_date) = try_parse_date(self.field_value(FieldId::StartDate)) else {
+            return "---- --".to_string();
+        };
+
+        let (year, month) = add_months(start_date.year, start_date.month, month_index as i32);
         format!("{year:04}-{month:02}")
     }
 
     pub fn input_char(&mut self, c: char) {
         let active = self.active_field();
-        if !active.is_numeric_input() {
+        if !active.is_text_input() {
+            return;
+        }
+
+        if active.is_date() {
+            if c.is_ascii_digit() || c == '-' {
+                self.inputs[active.index()].push(c);
+            }
+            return;
+        }
+
+        if active.is_integer() {
+            if c.is_ascii_digit() {
+                self.inputs[active.index()].push(c);
+            }
             return;
         }
 
@@ -278,10 +299,6 @@ impl App {
         }
 
         if c == '.' {
-            if active.is_integer() {
-                return;
-            }
-
             let value = &self.inputs[active.index()];
             if value.contains('.') {
                 return;
@@ -296,7 +313,7 @@ impl App {
     }
 
     pub fn backspace(&mut self) {
-        if !self.active_field().is_numeric_input() {
+        if !self.active_field().is_text_input() {
             return;
         }
 
@@ -515,6 +532,12 @@ impl App {
             self.field_value(FieldId::InterestRate),
         )?;
         let term_years = parse_u32(FieldId::TermYears, self.field_value(FieldId::TermYears))?;
+        let start_date = parse_date(FieldId::StartDate, self.field_value(FieldId::StartDate))?;
+        let payment_day = parse_u32(FieldId::PaymentDay, self.field_value(FieldId::PaymentDay))?;
+
+        if payment_day == 0 || payment_day > 31 {
+            return Err("Payment Day must be between 1 and 31".to_string());
+        }
 
         let rate_overrides = self
             .rate_overrides
@@ -532,18 +555,24 @@ impl App {
             round_monthly_payment_up: self.round_payments_up,
             base_annual_interest_rate_pct,
             term_years,
+            start_date,
+            payment_day,
             rate_overrides,
         })
     }
 }
 
-fn default_inputs() -> [String; NUMERIC_FIELD_COUNT] {
+fn default_inputs() -> [String; TEXT_FIELD_COUNT] {
+    let (year, month, day) = current_utc_year_month_day();
+
     [
         "300000".to_string(),
         "8000".to_string(),
         "120".to_string(),
         "6.0".to_string(),
         "30".to_string(),
+        format!("{year:04}-{month:02}-{day:02}"),
+        day.to_string(),
     ]
 }
 
@@ -569,6 +598,20 @@ fn parse_u32(field: FieldId, value: &str) -> Result<u32, String> {
         .map_err(|_| format!("{} must be a whole number", field.label()))
 }
 
+fn parse_date(field: FieldId, value: &str) -> Result<DateYmd, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{} is required", field.label()));
+    }
+
+    DateYmd::parse_yyyy_mm_dd(trimmed)
+        .ok_or_else(|| format!("{} must be in YYYY-MM-DD format", field.label()))
+}
+
+fn try_parse_date(value: &str) -> Option<DateYmd> {
+    DateYmd::parse_yyyy_mm_dd(value.trim())
+}
+
 fn format_rate_for_input(value: f64) -> String {
     let mut formatted = format!("{value:.6}");
     while formatted.contains('.') && formatted.ends_with('0') {
@@ -586,15 +629,14 @@ fn format_rate_for_input(value: f64) -> String {
     formatted
 }
 
-fn current_utc_year_month() -> (i32, u32) {
+fn current_utc_year_month_day() -> (i32, u32, u32) {
     let secs_since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0);
 
     let days_since_epoch = secs_since_epoch.div_euclid(86_400);
-    let (year, month, _) = civil_from_days(days_since_epoch);
-    (year, month)
+    civil_from_days(days_since_epoch)
 }
 
 fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
@@ -704,6 +746,32 @@ mod tests {
             .expect("metrics should exist after moving selection");
         assert_eq!(app.selected_month, 12);
         assert_eq!(metrics.selected_month, 12);
+    }
+
+    #[test]
+    fn invalid_start_date_sets_error() {
+        let mut app = App::default();
+        app.inputs[5] = "2026-13-99".to_string();
+
+        app.recalculate();
+
+        assert_eq!(
+            app.error.as_deref(),
+            Some("Start Date (YYYY-MM-DD) must be in YYYY-MM-DD format")
+        );
+    }
+
+    #[test]
+    fn invalid_payment_day_sets_error() {
+        let mut app = App::default();
+        app.inputs[6] = "0".to_string();
+
+        app.recalculate();
+
+        assert_eq!(
+            app.error.as_deref(),
+            Some("Payment Day must be between 1 and 31")
+        );
     }
 
     #[test]

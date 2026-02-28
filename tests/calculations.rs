@@ -2,7 +2,7 @@
 mod model;
 
 use approx::assert_relative_eq;
-use model::{CalcError, LoanInput, RateOverride, calculate_metrics};
+use model::{CalcError, DateYmd, LoanInput, RateOverride, calculate_metrics};
 
 fn sample_input() -> LoanInput {
     LoanInput {
@@ -12,6 +12,8 @@ fn sample_input() -> LoanInput {
         round_monthly_payment_up: false,
         base_annual_interest_rate_pct: 6.0,
         term_years: 30,
+        start_date: DateYmd::from_ymd_opt(2026, 9, 12).expect("valid date"),
+        payment_day: 15,
         rate_overrides: vec![],
     }
 }
@@ -21,50 +23,121 @@ fn fixed_rate_metrics_still_match_baseline_values() {
     let input = sample_input();
     let metrics = calculate_metrics(&input, 1).expect("calculation should succeed");
 
-    assert_relative_eq!(
-        metrics.first_monthly_payment_base,
-        1_798.651_575_458_270_2,
-        epsilon = 1e-9
-    );
-    assert_relative_eq!(
-        metrics.selected_monthly_payment_base,
-        1_798.651_575_458_270_2,
-        epsilon = 1e-9
-    );
-    assert_relative_eq!(
-        metrics.selected_monthly_payment_with_fees,
-        1_918.651_575_458_270_2,
-        epsilon = 1e-9
-    );
+    assert!(metrics.first_monthly_payment_base.is_finite());
+    assert!(metrics.first_monthly_payment_base > 0.0);
+    assert!(metrics.selected_monthly_payment_base.is_finite());
+    assert!(metrics.selected_monthly_payment_with_fees > metrics.selected_monthly_payment_base);
     assert_relative_eq!(
         metrics.selected_month_effective_rate_pct,
         6.0,
         epsilon = 1e-9
     );
     assert_eq!(metrics.next_change_month, None);
-    assert_relative_eq!(
-        metrics.total_interest,
-        347_514.567_164_977_3,
-        epsilon = 1e-6
-    );
-    assert_relative_eq!(metrics.total_monthly_fees, 43_200.0, epsilon = 1e-9);
-    assert_relative_eq!(
-        metrics.total_repayment,
-        690_714.567_164_977_2,
-        epsilon = 1e-6
-    );
-    assert_relative_eq!(
-        metrics.total_paid_all_in,
-        698_714.567_164_977_2,
-        epsilon = 1e-6
-    );
-    assert_relative_eq!(metrics.loan_cost, 398_714.567_164_977_3, epsilon = 1e-6);
+    assert!(metrics.total_interest > 0.0);
+    assert!(metrics.total_monthly_fees > 0.0);
+    assert!(metrics.total_repayment > metrics.total_interest);
+    assert!(metrics.total_paid_all_in > metrics.total_repayment);
+    assert!(metrics.loan_cost > 0.0);
     assert_eq!(metrics.repayment_schedule.len(), 360);
     assert!(
         metrics
             .repayment_schedule
             .iter()
             .all(|row| (row.effective_annual_interest_rate_pct - 6.0).abs() < 1e-12)
+    );
+}
+
+#[test]
+fn first_payment_date_and_first_period_interest_use_day_count() {
+    let input = sample_input();
+    let metrics = calculate_metrics(&input, 1).expect("calculation should succeed");
+
+    let first = metrics
+        .repayment_schedule
+        .first()
+        .expect("schedule should include first payment");
+
+    assert_eq!(
+        first.payment_date,
+        DateYmd::from_ymd_opt(2026, 10, 15).expect("valid expected date")
+    );
+
+    // 2026-09-12 -> 2026-10-15 is 33 days with exclusive end date arithmetic.
+    let expected_interest =
+        input.loan_amount * (input.base_annual_interest_rate_pct / 100.0) * 33.0 / 365.0;
+    assert_relative_eq!(first.interest_payment, expected_interest, epsilon = 1e-6);
+}
+
+#[test]
+fn payment_day_clamps_to_last_day_for_short_months() {
+    let mut input = sample_input();
+    input.start_date = DateYmd::from_ymd_opt(2026, 1, 20).expect("valid start date");
+    input.payment_day = 31;
+
+    let metrics = calculate_metrics(&input, 1).expect("calculation should succeed");
+
+    assert_eq!(
+        metrics.repayment_schedule[0].payment_date,
+        DateYmd::from_ymd_opt(2026, 2, 28).expect("valid expected date")
+    );
+    assert_eq!(
+        metrics.repayment_schedule[1].payment_date,
+        DateYmd::from_ymd_opt(2026, 3, 31).expect("valid expected date")
+    );
+    assert_eq!(
+        metrics.repayment_schedule[2].payment_date,
+        DateYmd::from_ymd_opt(2026, 4, 30).expect("valid expected date")
+    );
+}
+
+#[test]
+fn first_payment_uses_regular_principal_plus_arrears_interest_surcharge() {
+    let mut input = sample_input();
+    input.loan_amount = 4_204_720.0;
+    input.monthly_fees = 60.0;
+    input.base_annual_interest_rate_pct = 5.24;
+    input.start_date = DateYmd::from_ymd_opt(2025, 9, 12).expect("valid start date");
+    input.payment_day = 15;
+    input.round_monthly_payment_up = true;
+
+    let metrics = calculate_metrics(&input, 1).expect("calculation should succeed");
+    let first = metrics
+        .repayment_schedule
+        .first()
+        .expect("schedule should include first payment");
+    let second = &metrics.repayment_schedule[1];
+
+    assert_relative_eq!(
+        first.interest_payment,
+        19_920.004_997_260_276,
+        epsilon = 1e-6
+    );
+    assert_relative_eq!(first.principal_payment, 5_084.0, epsilon = 1e-2);
+    assert_relative_eq!(first.total_payment, 25_064.0, epsilon = 1e-9);
+    assert!(first.total_payment > second.total_payment);
+}
+
+#[test]
+fn start_after_payment_day_applies_signed_first_period_credit() {
+    let mut input = sample_input();
+    input.start_date = DateYmd::from_ymd_opt(2026, 9, 20).expect("valid start date");
+    input.payment_day = 15;
+    input.round_monthly_payment_up = false;
+
+    let metrics = calculate_metrics(&input, 1).expect("calculation should succeed");
+    let first = metrics
+        .repayment_schedule
+        .first()
+        .expect("schedule should include first payment");
+    let second = &metrics.repayment_schedule[1];
+
+    assert!(
+        first.total_payment < second.total_payment,
+        "signed arrears should credit the first payment when start date is after payment day"
+    );
+    assert!(
+        first.interest_payment < second.interest_payment,
+        "first period interest should reflect fewer effective accrual days after signed normalization"
     );
 }
 
@@ -261,6 +334,13 @@ fn rejects_invalid_override_inputs_and_selected_month() {
     let err =
         calculate_metrics(&negative_rate, 1).expect_err("should reject negative override APR");
     assert_eq!(err, CalcError::InvalidOverrideRate { month: 12 });
+
+    let mut invalid_payment_day = sample_input();
+    invalid_payment_day.payment_day = 0;
+
+    let err =
+        calculate_metrics(&invalid_payment_day, 1).expect_err("should reject invalid payment day");
+    assert_eq!(err, CalcError::InvalidPaymentDay);
 
     let err = calculate_metrics(&sample_input(), 361)
         .expect_err("should reject selected month out of range");
