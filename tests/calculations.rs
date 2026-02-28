@@ -144,9 +144,13 @@ fn start_after_payment_day_applies_signed_first_period_credit() {
 
 #[test]
 fn single_override_changes_payment_from_its_start_month() {
+    let baseline_schedule =
+        calculate_metrics(&sample_input(), 61).expect("baseline schedule should succeed");
+    let override_date = baseline_schedule.repayment_schedule[60].payment_date;
+
     let mut input = sample_input();
     input.rate_overrides.push(RateOverride {
-        start_month: 61,
+        effective_date: override_date,
         annual_interest_rate_pct: 7.0,
     });
 
@@ -181,18 +185,23 @@ fn single_override_changes_payment_from_its_start_month() {
 
 #[test]
 fn multiple_overrides_generate_expected_segments() {
+    let baseline = calculate_metrics(&sample_input(), 1).expect("baseline should succeed");
+    let month_25_date = baseline.repayment_schedule[24].payment_date;
+    let month_49_date = baseline.repayment_schedule[48].payment_date;
+    let month_97_date = baseline.repayment_schedule[96].payment_date;
+
     let mut input = sample_input();
     input.rate_overrides = vec![
         RateOverride {
-            start_month: 25,
+            effective_date: month_25_date,
             annual_interest_rate_pct: 4.5,
         },
         RateOverride {
-            start_month: 49,
+            effective_date: month_49_date,
             annual_interest_rate_pct: 8.0,
         },
         RateOverride {
-            start_month: 97,
+            effective_date: month_97_date,
             annual_interest_rate_pct: 5.0,
         },
     ];
@@ -235,7 +244,7 @@ fn month_one_override_supersedes_base_rate() {
     let mut override_input = sample_input();
     override_input.base_annual_interest_rate_pct = 5.0;
     override_input.rate_overrides = vec![RateOverride {
-        start_month: 1,
+        effective_date: override_input.start_date,
         annual_interest_rate_pct: 6.0,
     }];
 
@@ -256,14 +265,18 @@ fn month_one_override_supersedes_base_rate() {
 
 #[test]
 fn zero_interest_segment_is_supported() {
+    let baseline = calculate_metrics(&sample_input(), 1).expect("baseline should succeed");
+    let month_61_date = baseline.repayment_schedule[60].payment_date;
+    let month_121_date = baseline.repayment_schedule[120].payment_date;
+
     let mut input = sample_input();
     input.rate_overrides = vec![
         RateOverride {
-            start_month: 61,
+            effective_date: month_61_date,
             annual_interest_rate_pct: 0.0,
         },
         RateOverride {
-            start_month: 121,
+            effective_date: month_121_date,
             annual_interest_rate_pct: 6.0,
         },
     ];
@@ -281,60 +294,72 @@ fn zero_interest_segment_is_supported() {
 
 #[test]
 fn rejects_invalid_override_inputs_and_selected_month() {
+    let start_date = sample_input().start_date;
+    let duplicate_date = DateYmd::from_ymd_opt(2026, 12, 1).expect("valid date");
+    let before_start_date = DateYmd::from_ymd_opt(2026, 9, 1).expect("valid date");
+    let after_last_payment_date = DateYmd::from_ymd_opt(2056, 10, 16).expect("valid date");
+
     let mut duplicate = sample_input();
     duplicate.rate_overrides = vec![
         RateOverride {
-            start_month: 12,
+            effective_date: duplicate_date,
             annual_interest_rate_pct: 5.0,
         },
         RateOverride {
-            start_month: 12,
+            effective_date: duplicate_date,
             annual_interest_rate_pct: 6.0,
         },
     ];
 
-    let err = calculate_metrics(&duplicate, 1).expect_err("should reject duplicate months");
-    assert_eq!(err, CalcError::DuplicateOverrideMonth(12));
+    let err = calculate_metrics(&duplicate, 1).expect_err("should reject duplicate dates");
+    assert_eq!(err, CalcError::DuplicateOverrideDate(duplicate_date));
 
-    let mut month_zero = sample_input();
-    month_zero.rate_overrides = vec![RateOverride {
-        start_month: 0,
+    let mut before_start = sample_input();
+    before_start.rate_overrides = vec![RateOverride {
+        effective_date: before_start_date,
         annual_interest_rate_pct: 5.0,
     }];
 
-    let err = calculate_metrics(&month_zero, 1).expect_err("should reject month 0 override");
+    let err = calculate_metrics(&before_start, 1).expect_err("should reject override before start");
     assert_eq!(
         err,
-        CalcError::InvalidOverrideMonth {
-            month: 0,
-            max_month: 360
+        CalcError::InvalidOverrideDate {
+            date: before_start_date,
+            min_date: start_date,
+            max_date: DateYmd::from_ymd_opt(2056, 9, 15).expect("valid end date"),
         }
     );
 
     let mut beyond_term = sample_input();
     beyond_term.rate_overrides = vec![RateOverride {
-        start_month: 361,
+        effective_date: after_last_payment_date,
         annual_interest_rate_pct: 5.0,
     }];
 
     let err = calculate_metrics(&beyond_term, 1).expect_err("should reject out-of-range override");
     assert_eq!(
         err,
-        CalcError::InvalidOverrideMonth {
-            month: 361,
-            max_month: 360
+        CalcError::InvalidOverrideDate {
+            date: after_last_payment_date,
+            min_date: start_date,
+            max_date: DateYmd::from_ymd_opt(2056, 9, 15).expect("valid end date"),
         }
     );
 
     let mut negative_rate = sample_input();
     negative_rate.rate_overrides = vec![RateOverride {
-        start_month: 12,
+        effective_date: duplicate_date,
         annual_interest_rate_pct: -1.0,
     }];
 
     let err =
         calculate_metrics(&negative_rate, 1).expect_err("should reject negative override APR");
-    assert_eq!(err, CalcError::InvalidOverrideRate { month: 12 });
+    assert_eq!(
+        err,
+        CalcError::InvalidOverrideRate {
+            date: duplicate_date
+        }
+    );
 
     let mut invalid_payment_day = sample_input();
     invalid_payment_day.payment_day = 0;
@@ -351,6 +376,36 @@ fn rejects_invalid_override_inputs_and_selected_month() {
             month: 361,
             max_month: 360
         }
+    );
+}
+
+#[test]
+fn mid_cycle_override_splits_interest_by_days_and_apr_applies_on_payment_date() {
+    let mut input = sample_input();
+    let override_date = DateYmd::from_ymd_opt(2026, 10, 1).expect("valid date");
+    input.rate_overrides = vec![RateOverride {
+        effective_date: override_date,
+        annual_interest_rate_pct: 12.0,
+    }];
+
+    let metrics = calculate_metrics(&input, 1).expect("calculation should succeed");
+    let first = metrics
+        .repayment_schedule
+        .first()
+        .expect("schedule should include first payment");
+
+    let low_days = (override_date.days_since_epoch() - input.start_date.days_since_epoch()) as f64;
+    let high_days =
+        (first.payment_date.days_since_epoch() - override_date.days_since_epoch()) as f64;
+    let expected_interest = input.loan_amount
+        * ((input.base_annual_interest_rate_pct / 100.0) * (low_days / 365.0)
+            + (12.0 / 100.0) * (high_days / 365.0));
+
+    assert_relative_eq!(first.interest_payment, expected_interest, epsilon = 1e-6);
+    assert_relative_eq!(
+        first.effective_annual_interest_rate_pct,
+        12.0,
+        epsilon = 1e-12
     );
 }
 

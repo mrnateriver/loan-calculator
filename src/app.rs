@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -79,21 +79,60 @@ pub enum FocusArea {
     Schedule,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowRatePopupField {
+    EffectiveDate,
+    Apr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScheduleDisplayRow {
+    Payment {
+        schedule_index: usize,
+        month_index: u32,
+        payment_date: DateYmd,
+    },
+    AprChangeMarker {
+        effective_date: DateYmd,
+        annual_interest_rate_pct: f64,
+        target_month: u32,
+    },
+}
+
+impl ScheduleDisplayRow {
+    pub fn date(self) -> DateYmd {
+        match self {
+            ScheduleDisplayRow::Payment { payment_date, .. } => payment_date,
+            ScheduleDisplayRow::AprChangeMarker { effective_date, .. } => effective_date,
+        }
+    }
+
+    pub fn target_month(self) -> u32 {
+        match self {
+            ScheduleDisplayRow::Payment { month_index, .. } => month_index,
+            ScheduleDisplayRow::AprChangeMarker { target_month, .. } => target_month,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct App {
     pub inputs: [String; TEXT_FIELD_COUNT],
     pub metrics: Option<LoanMetrics>,
     pub error: Option<String>,
     pub is_row_rate_popup_open: bool,
-    pub row_rate_input_buffer: String,
+    pub row_rate_date_input_buffer: String,
+    pub row_rate_apr_input_buffer: String,
+    pub row_rate_popup_active_field: RowRatePopupField,
     pub selected_month: u32,
     pub round_payments_up: bool,
     pub focus_area: FocusArea,
+    pub schedule_rows: Vec<ScheduleDisplayRow>,
     pub schedule_selected_index: usize,
     pub schedule_scroll_offset: usize,
     active_field_idx: usize,
     schedule_viewport_rows: usize,
-    rate_overrides: BTreeMap<u32, f64>,
+    rate_overrides: BTreeMap<DateYmd, f64>,
 }
 
 impl Default for App {
@@ -103,10 +142,13 @@ impl Default for App {
             metrics: None,
             error: None,
             is_row_rate_popup_open: false,
-            row_rate_input_buffer: String::new(),
+            row_rate_date_input_buffer: String::new(),
+            row_rate_apr_input_buffer: String::new(),
+            row_rate_popup_active_field: RowRatePopupField::EffectiveDate,
             selected_month: 1,
             round_payments_up: false,
             focus_area: FocusArea::Inputs,
+            schedule_rows: Vec::new(),
             schedule_selected_index: 0,
             schedule_scroll_offset: 0,
             active_field_idx: 0,
@@ -196,7 +238,7 @@ impl App {
     }
 
     pub fn move_schedule_selection_to_start(&mut self) {
-        let row_count = self.selectable_month_count();
+        let row_count = self.selectable_row_count();
         if row_count == 0 || self.schedule_selected_index == 0 {
             return;
         }
@@ -208,7 +250,7 @@ impl App {
     }
 
     pub fn move_schedule_selection_to_end(&mut self) {
-        let row_count = self.selectable_month_count();
+        let row_count = self.selectable_row_count();
         if row_count == 0 {
             return;
         }
@@ -225,7 +267,7 @@ impl App {
     }
 
     pub fn move_schedule_selection(&mut self, delta: i32) {
-        let row_count = self.selectable_month_count();
+        let row_count = self.selectable_row_count();
         if row_count == 0 {
             self.schedule_selected_index = 0;
             self.selected_month = 1;
@@ -253,12 +295,24 @@ impl App {
     pub fn open_row_rate_popup(&mut self) {
         self.clamp_schedule_selection();
         self.sync_selected_month_from_selection();
-        self.sync_row_rate_input_buffer();
+        self.sync_row_rate_popup_inputs();
+        self.row_rate_popup_active_field = RowRatePopupField::EffectiveDate;
         self.is_row_rate_popup_open = true;
     }
 
     pub fn close_row_rate_popup(&mut self) {
         self.is_row_rate_popup_open = false;
+    }
+
+    pub fn row_rate_popup_next_field(&mut self) {
+        self.row_rate_popup_active_field = match self.row_rate_popup_active_field {
+            RowRatePopupField::EffectiveDate => RowRatePopupField::Apr,
+            RowRatePopupField::Apr => RowRatePopupField::EffectiveDate,
+        };
+    }
+
+    pub fn row_rate_popup_previous_field(&mut self) {
+        self.row_rate_popup_next_field();
     }
 
     pub fn format_schedule_month(&self, month_index: u32) -> String {
@@ -330,10 +384,13 @@ impl App {
         self.active_field_idx = 0;
         self.error = None;
         self.is_row_rate_popup_open = false;
-        self.row_rate_input_buffer.clear();
+        self.row_rate_date_input_buffer.clear();
+        self.row_rate_apr_input_buffer.clear();
+        self.row_rate_popup_active_field = RowRatePopupField::EffectiveDate;
         self.selected_month = 1;
         self.round_payments_up = false;
         self.focus_area = FocusArea::Inputs;
+        self.schedule_rows.clear();
         self.schedule_selected_index = 0;
         self.schedule_scroll_offset = 0;
         self.rate_overrides.clear();
@@ -348,14 +405,17 @@ impl App {
                 Ok(metrics) => {
                     self.metrics = Some(metrics);
                     self.error = None;
+                    self.rebuild_schedule_rows();
                 }
                 Err(err) => {
                     self.metrics = None;
+                    self.schedule_rows.clear();
                     self.error = Some(err.to_string());
                 }
             },
             Err(err) => {
                 self.metrics = None;
+                self.schedule_rows.clear();
                 self.error = Some(err);
             }
         }
@@ -363,44 +423,82 @@ impl App {
         self.clamp_schedule_selection();
         self.sync_selected_month_from_selection();
         self.ensure_schedule_selection_visible();
+
+        if let Some(metrics) = self.metrics.as_ref() {
+            if metrics.selected_month != self.selected_month {
+                if let Ok(input) = self.build_input() {
+                    if let Ok(updated) = calculate_metrics(&input, self.selected_month) {
+                        self.metrics = Some(updated);
+                        self.rebuild_schedule_rows();
+                        self.clamp_schedule_selection();
+                        self.sync_selected_month_from_selection();
+                        self.ensure_schedule_selection_visible();
+                    }
+                }
+            }
+        }
     }
 
     pub fn row_rate_input_char(&mut self, c: char) {
-        if !c.is_ascii_digit() && c != '.' {
-            return;
-        }
-
-        if c == '.' {
-            if self.row_rate_input_buffer.contains('.') {
-                return;
+        match self.row_rate_popup_active_field {
+            RowRatePopupField::EffectiveDate => {
+                if c.is_ascii_digit() || c == '-' {
+                    self.row_rate_date_input_buffer.push(c);
+                }
             }
+            RowRatePopupField::Apr => {
+                if !c.is_ascii_digit() && c != '.' {
+                    return;
+                }
 
-            if self.row_rate_input_buffer.is_empty() {
-                self.row_rate_input_buffer.push('0');
+                if c == '.' {
+                    if self.row_rate_apr_input_buffer.contains('.') {
+                        return;
+                    }
+
+                    if self.row_rate_apr_input_buffer.is_empty() {
+                        self.row_rate_apr_input_buffer.push('0');
+                    }
+                }
+
+                self.row_rate_apr_input_buffer.push(c);
             }
         }
-
-        self.row_rate_input_buffer.push(c);
     }
 
     pub fn row_rate_input_backspace(&mut self) {
-        self.row_rate_input_buffer.pop();
+        match self.row_rate_popup_active_field {
+            RowRatePopupField::EffectiveDate => {
+                self.row_rate_date_input_buffer.pop();
+            }
+            RowRatePopupField::Apr => {
+                self.row_rate_apr_input_buffer.pop();
+            }
+        }
     }
 
     pub fn apply_row_rate_override_at_selected_month(&mut self) {
-        let trimmed = self.row_rate_input_buffer.trim();
-        if trimmed.is_empty() {
+        let date = match parse_date_input_for_override(&self.row_rate_date_input_buffer) {
+            Ok(date) => date,
+            Err(err) => {
+                self.error = Some(err);
+                return;
+            }
+        };
+
+        let apr_trimmed = self.row_rate_apr_input_buffer.trim();
+        if apr_trimmed.is_empty() {
             self.error = Some("Rate override APR is required".to_string());
             return;
         }
 
-        match trimmed.parse::<f64>() {
+        match apr_trimmed.parse::<f64>() {
             Ok(parsed) if parsed.is_finite() && parsed >= 0.0 => {
-                self.rate_overrides.insert(self.selected_month, parsed);
+                self.rate_overrides.insert(date, parsed);
                 self.error = None;
-                self.sync_row_rate_input_buffer();
-                self.is_row_rate_popup_open = false;
                 self.recalculate();
+                self.select_schedule_row_by_date(date, true);
+                self.is_row_rate_popup_open = false;
             }
             _ => {
                 self.error = Some("Rate override APR must be a non-negative number".to_string());
@@ -409,33 +507,37 @@ impl App {
     }
 
     pub fn clear_row_rate_override_at_selected_month(&mut self) {
-        self.rate_overrides.remove(&self.selected_month);
+        let date = match parse_date_input_for_override(&self.row_rate_date_input_buffer) {
+            Ok(date) => date,
+            Err(err) => {
+                self.error = Some(err);
+                return;
+            }
+        };
+
+        self.rate_overrides.remove(&date);
         self.error = None;
-        self.sync_row_rate_input_buffer();
-        self.is_row_rate_popup_open = false;
         self.recalculate();
+        self.select_schedule_row_by_date(date, false);
+        self.is_row_rate_popup_open = false;
     }
 
     pub fn override_count(&self) -> usize {
         self.rate_overrides.len()
     }
 
-    pub fn override_for_month(&self, month: u32) -> Option<f64> {
-        self.rate_overrides.get(&month).copied()
+    pub fn override_for_date(&self, date: DateYmd) -> Option<f64> {
+        self.rate_overrides.get(&date).copied()
     }
 
-    pub fn effective_rate_for_month(&self, month: u32) -> Option<f64> {
-        if month == 0 {
-            return None;
-        }
-
+    pub fn effective_rate_for_date(&self, date: DateYmd) -> Option<f64> {
         let mut effective = parse_f64(
             FieldId::InterestRate,
             self.field_value(FieldId::InterestRate),
         )
         .ok()?;
 
-        for (_, override_rate) in self.rate_overrides.range(..=month) {
+        for (_, override_rate) in self.rate_overrides.range(..=date) {
             effective = *override_rate;
         }
 
@@ -443,10 +545,19 @@ impl App {
     }
 
     fn normalize_rate_state(&mut self) {
-        if let Some(max_month) = self.term_months_from_input() {
-            self.rate_overrides.retain(|month, _| *month <= max_month);
-            let max_index = max_month.saturating_sub(1) as usize;
-            self.schedule_selected_index = self.schedule_selected_index.min(max_index);
+        if let Some((start_date, last_payment_date)) = self.override_date_range_from_inputs() {
+            self.rate_overrides.retain(|effective_date, _| {
+                *effective_date >= start_date && *effective_date <= last_payment_date
+            });
+        }
+
+        if self.schedule_rows.is_empty() {
+            if let Some(max_rows) = self.term_months_from_input() {
+                let max_index = max_rows.saturating_sub(1) as usize;
+                self.schedule_selected_index = self.schedule_selected_index.min(max_index);
+            } else {
+                self.clamp_schedule_selection();
+            }
         } else {
             self.clamp_schedule_selection();
         }
@@ -454,7 +565,11 @@ impl App {
         self.sync_selected_month_from_selection();
     }
 
-    fn selectable_month_count(&self) -> usize {
+    fn selectable_row_count(&self) -> usize {
+        if !self.schedule_rows.is_empty() {
+            return self.schedule_rows.len();
+        }
+
         if let Some(months) = self.term_months_from_input() {
             return months as usize;
         }
@@ -466,7 +581,7 @@ impl App {
     }
 
     fn clamp_schedule_selection(&mut self) {
-        let row_count = self.selectable_month_count();
+        let row_count = self.selectable_row_count();
         if row_count == 0 {
             self.schedule_selected_index = 0;
         } else {
@@ -475,7 +590,7 @@ impl App {
     }
 
     fn ensure_schedule_selection_visible(&mut self) {
-        let row_count = self.selectable_month_count();
+        let row_count = self.selectable_row_count();
         if row_count == 0 {
             self.schedule_scroll_offset = 0;
             return;
@@ -502,15 +617,174 @@ impl App {
     }
 
     fn sync_selected_month_from_selection(&mut self) {
-        self.selected_month = self.schedule_selected_index.saturating_add(1) as u32;
+        if let Some(row) = self
+            .schedule_rows
+            .get(self.schedule_selected_index)
+            .copied()
+        {
+            self.selected_month = row.target_month();
+        } else {
+            self.selected_month = self.schedule_selected_index.saturating_add(1) as u32;
+        }
     }
 
-    fn sync_row_rate_input_buffer(&mut self) {
-        if let Some(rate) = self.rate_overrides.get(&self.selected_month).copied() {
-            self.row_rate_input_buffer = format_rate_for_input(rate);
+    fn sync_row_rate_popup_inputs(&mut self) {
+        let Some(row) = self
+            .schedule_rows
+            .get(self.schedule_selected_index)
+            .copied()
+        else {
+            self.row_rate_date_input_buffer.clear();
+            self.row_rate_apr_input_buffer.clear();
+            return;
+        };
+
+        let selected_date = row.date();
+        self.row_rate_date_input_buffer = selected_date.format_yyyy_mm_dd();
+
+        let apr = match row {
+            ScheduleDisplayRow::Payment { payment_date, .. } => {
+                self.rate_overrides.get(&payment_date).copied()
+            }
+            ScheduleDisplayRow::AprChangeMarker {
+                annual_interest_rate_pct,
+                ..
+            } => Some(annual_interest_rate_pct),
+        };
+
+        if let Some(apr) = apr {
+            self.row_rate_apr_input_buffer = format_rate_for_input(apr);
         } else {
-            self.row_rate_input_buffer.clear();
+            self.row_rate_apr_input_buffer.clear();
         }
+    }
+
+    pub fn selected_schedule_row(&self) -> Option<ScheduleDisplayRow> {
+        self.schedule_rows
+            .get(self.schedule_selected_index)
+            .copied()
+    }
+
+    fn rebuild_schedule_rows(&mut self) {
+        self.schedule_rows.clear();
+
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+
+        let payment_dates: BTreeSet<DateYmd> = metrics
+            .repayment_schedule
+            .iter()
+            .map(|entry| entry.payment_date)
+            .collect();
+
+        for (schedule_index, entry) in metrics.repayment_schedule.iter().enumerate() {
+            self.schedule_rows.push(ScheduleDisplayRow::Payment {
+                schedule_index,
+                month_index: entry.month_index,
+                payment_date: entry.payment_date,
+            });
+        }
+
+        for (effective_date, annual_interest_rate_pct) in &self.rate_overrides {
+            if payment_dates.contains(effective_date) {
+                continue;
+            }
+
+            let target_month = metrics
+                .repayment_schedule
+                .iter()
+                .find(|entry| entry.payment_date > *effective_date)
+                .map(|entry| entry.month_index)
+                .or_else(|| {
+                    metrics
+                        .repayment_schedule
+                        .last()
+                        .map(|entry| entry.month_index)
+                })
+                .unwrap_or(1);
+
+            self.schedule_rows
+                .push(ScheduleDisplayRow::AprChangeMarker {
+                    effective_date: *effective_date,
+                    annual_interest_rate_pct: *annual_interest_rate_pct,
+                    target_month,
+                });
+        }
+
+        self.schedule_rows.sort_by(|left, right| {
+            let left_date = left.date();
+            let right_date = right.date();
+            left_date.cmp(&right_date).then_with(|| {
+                let left_priority = match left {
+                    ScheduleDisplayRow::Payment { .. } => 0_u8,
+                    ScheduleDisplayRow::AprChangeMarker { .. } => 1_u8,
+                };
+                let right_priority = match right {
+                    ScheduleDisplayRow::Payment { .. } => 0_u8,
+                    ScheduleDisplayRow::AprChangeMarker { .. } => 1_u8,
+                };
+                left_priority.cmp(&right_priority)
+            })
+        });
+    }
+
+    fn select_schedule_row_by_date(&mut self, date: DateYmd, prefer_marker: bool) {
+        if self.schedule_rows.is_empty() {
+            return;
+        }
+
+        let mut exact_payment = None;
+        let mut exact_marker = None;
+        let mut next_by_date = None;
+
+        for (index, row) in self.schedule_rows.iter().enumerate() {
+            if next_by_date.is_none() && row.date() >= date {
+                next_by_date = Some(index);
+            }
+
+            if row.date() == date {
+                match row {
+                    ScheduleDisplayRow::Payment { .. } => exact_payment = Some(index),
+                    ScheduleDisplayRow::AprChangeMarker { .. } => exact_marker = Some(index),
+                }
+            }
+        }
+
+        let fallback = next_by_date.unwrap_or(self.schedule_rows.len().saturating_sub(1));
+        let target_index = if prefer_marker {
+            exact_marker.or(exact_payment).unwrap_or(fallback)
+        } else {
+            exact_payment.or(exact_marker).unwrap_or(fallback)
+        };
+
+        if target_index == self.schedule_selected_index {
+            return;
+        }
+
+        self.schedule_selected_index = target_index;
+        self.sync_selected_month_from_selection();
+        self.ensure_schedule_selection_visible();
+        self.recalculate();
+    }
+
+    fn override_date_range_from_inputs(&self) -> Option<(DateYmd, DateYmd)> {
+        let total_months = self.term_months_from_input()?;
+        let start_date = try_parse_date(self.field_value(FieldId::StartDate))?;
+        let payment_day =
+            parse_u32(FieldId::PaymentDay, self.field_value(FieldId::PaymentDay)).ok()?;
+        if payment_day == 0 || payment_day > 31 {
+            return None;
+        }
+
+        let (last_payment_year, last_payment_month) =
+            add_months(start_date.year, start_date.month, total_months as i32);
+        let last_payment_day =
+            payment_day.min(last_day_of_month(last_payment_year, last_payment_month));
+        let last_payment_date =
+            DateYmd::from_ymd_opt(last_payment_year, last_payment_month, last_payment_day)?;
+
+        Some((start_date, last_payment_date))
     }
 
     fn term_months_from_input(&self) -> Option<u32> {
@@ -542,8 +816,8 @@ impl App {
         let rate_overrides = self
             .rate_overrides
             .iter()
-            .map(|(start_month, annual_interest_rate_pct)| RateOverride {
-                start_month: *start_month,
+            .map(|(effective_date, annual_interest_rate_pct)| RateOverride {
+                effective_date: *effective_date,
                 annual_interest_rate_pct: *annual_interest_rate_pct,
             })
             .collect();
@@ -612,6 +886,16 @@ fn try_parse_date(value: &str) -> Option<DateYmd> {
     DateYmd::parse_yyyy_mm_dd(value.trim())
 }
 
+fn parse_date_input_for_override(value: &str) -> Result<DateYmd, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Rate override effective date is required".to_string());
+    }
+
+    DateYmd::parse_yyyy_mm_dd(trimmed)
+        .ok_or_else(|| "Rate override effective date must be in YYYY-MM-DD format".to_string())
+}
+
 fn format_rate_for_input(value: f64) -> String {
     let mut formatted = format!("{value:.6}");
     while formatted.contains('.') && formatted.ends_with('0') {
@@ -664,15 +948,32 @@ fn add_months(year: i32, month: u32, delta_months: i32) -> (i32, u32) {
     (new_year, new_month as u32)
 }
 
+fn last_day_of_month(year: i32, month: u32) -> u32 {
+    for day in (28..=31).rev() {
+        if DateYmd::from_ymd_opt(year, month, day).is_some() {
+            return day;
+        }
+    }
+
+    28
+}
+
 #[cfg(test)]
 mod tests {
-    use super::App;
+    use super::{App, ScheduleDisplayRow};
+    use crate::model::DateYmd;
 
     #[test]
     fn term_reduction_prunes_overrides_and_clamps_selected_month() {
         let mut app = App::default();
-        app.rate_overrides.insert(120, 7.0);
-        app.rate_overrides.insert(300, 8.0);
+        app.inputs[5] = "2026-09-12".to_string();
+        app.inputs[6] = "15".to_string();
+        app.recalculate();
+
+        let keep_date = DateYmd::from_ymd_opt(2036, 9, 15).expect("valid date");
+        let pruned_date = DateYmd::from_ymd_opt(2046, 9, 15).expect("valid date");
+        app.rate_overrides.insert(keep_date, 7.0);
+        app.rate_overrides.insert(pruned_date, 8.0);
         app.schedule_selected_index = 239;
         app.inputs[4] = "10".to_string();
 
@@ -680,8 +981,8 @@ mod tests {
 
         assert_eq!(app.schedule_selected_index, 119);
         assert_eq!(app.selected_month, 120);
-        assert!(app.rate_overrides.contains_key(&120));
-        assert!(!app.rate_overrides.contains_key(&300));
+        assert!(app.rate_overrides.contains_key(&keep_date));
+        assert!(!app.rate_overrides.contains_key(&pruned_date));
     }
 
     #[test]
@@ -689,19 +990,72 @@ mod tests {
         let mut app = App::default();
         app.focus_schedule();
         app.move_schedule_selection(14);
+        let selected_date = app
+            .selected_schedule_row()
+            .expect("selected row should exist")
+            .date();
 
         app.open_row_rate_popup();
-        app.row_rate_input_buffer = "7.25".to_string();
+        app.row_rate_apr_input_buffer = "7.25".to_string();
         app.apply_row_rate_override_at_selected_month();
 
         assert_eq!(app.selected_month, 15);
-        assert_eq!(app.override_for_month(15), Some(7.25));
+        assert_eq!(app.override_for_date(selected_date), Some(7.25));
         assert!(!app.is_row_rate_popup_open);
 
         app.open_row_rate_popup();
         app.clear_row_rate_override_at_selected_month();
-        assert_eq!(app.override_for_month(15), None);
+        assert_eq!(app.override_for_date(selected_date), None);
         assert!(!app.is_row_rate_popup_open);
+    }
+
+    #[test]
+    fn non_payment_date_override_creates_marker_row_targeting_next_month() {
+        let mut app = App::default();
+        app.inputs[5] = "2026-09-12".to_string();
+        app.inputs[6] = "15".to_string();
+        app.recalculate();
+
+        let marker_date = DateYmd::from_ymd_opt(2026, 11, 1).expect("valid date");
+        app.rate_overrides.insert(marker_date, 8.0);
+        app.recalculate();
+
+        let marker_index = app
+            .schedule_rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    ScheduleDisplayRow::AprChangeMarker { effective_date, target_month, .. }
+                        if *effective_date == marker_date && *target_month == 2
+                )
+            })
+            .expect("marker row should exist");
+
+        app.schedule_selected_index = marker_index;
+        app.sync_selected_month_from_selection();
+        app.recalculate();
+
+        let metrics = app.metrics.as_ref().expect("metrics should exist");
+        assert_eq!(app.selected_month, 2);
+        assert_eq!(metrics.selected_month, 2);
+    }
+
+    #[test]
+    fn payment_date_override_does_not_create_marker_row() {
+        let mut app = App::default();
+        app.inputs[5] = "2026-09-12".to_string();
+        app.inputs[6] = "15".to_string();
+        app.recalculate();
+
+        let month_two_payment_date = DateYmd::from_ymd_opt(2026, 11, 15).expect("valid date");
+        app.rate_overrides.insert(month_two_payment_date, 7.0);
+        app.recalculate();
+
+        assert!(app
+            .schedule_rows
+            .iter()
+            .all(|row| !matches!(row, ScheduleDisplayRow::AprChangeMarker { effective_date, .. } if *effective_date == month_two_payment_date)));
     }
 
     #[test]

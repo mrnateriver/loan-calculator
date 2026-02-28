@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
-use crate::app::{App, FieldId};
+use crate::app::{App, FieldId, RowRatePopupField, ScheduleDisplayRow};
 use crate::model::LoanMetrics;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -76,10 +76,7 @@ fn render_form(frame: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .title(" Inputs ")
                 .borders(Borders::ALL)
-                .border_style(panel_border_style(
-                    Color::Cyan,
-                    !app.is_schedule_focused(),
-                )),
+                .border_style(panel_border_style(Color::Cyan, !app.is_schedule_focused())),
         )
         .wrap(Wrap { trim: false });
 
@@ -108,10 +105,7 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
     let schedule_block = Block::default()
         .title(" Repayment Schedule ")
         .borders(Borders::ALL)
-        .border_style(panel_border_style(
-            Color::Blue,
-            app.is_schedule_focused(),
-        ));
+        .border_style(panel_border_style(Color::Blue, app.is_schedule_focused()));
 
     let inner = schedule_block.inner(area);
     frame.render_widget(schedule_block, area);
@@ -127,7 +121,7 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut lines = Vec::new();
 
     if let Some(metrics) = app.metrics.as_ref() {
-        let total_rows = metrics.repayment_schedule.len();
+        let total_rows = app.schedule_rows.len();
 
         let offset = if total_rows == 0 {
             0
@@ -138,29 +132,46 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
 
         lines.push(Line::styled(
             format!(
-                "{:<8} {:<10} {:>8} {:>12} {:>12} {:>12} {:>10}",
-                "Month", "Date", "APR(%)", "Payment", "Interest", "Principal", "Fees"
+                "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10}",
+                "Date", "APR(%)", "Payment", "Interest", "Principal", "Fees"
             ),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ));
 
-        for (visible_idx, entry) in metrics.repayment_schedule[offset..end].iter().enumerate() {
+        for (visible_idx, row) in app.schedule_rows[offset..end].iter().enumerate() {
             let absolute_idx = offset + visible_idx;
             let is_selected = absolute_idx == app.schedule_selected_index;
-            let month_label = entry.payment_date.format_yyyy_mm();
-            let date_label = entry.payment_date.format_yyyy_mm_dd();
-            let line = format!(
-                "{:<8} {:<10} {:>8} {:>12} {:>12} {:>12} {:>10}",
-                month_label,
-                date_label,
-                format_rate(entry.effective_annual_interest_rate_pct),
-                money(entry.total_payment),
-                money(entry.interest_payment),
-                money(entry.principal_payment),
-                money(entry.fees_payment),
-            );
+            let line = match row {
+                ScheduleDisplayRow::Payment { schedule_index, .. } => {
+                    let entry = &metrics.repayment_schedule[*schedule_index];
+                    format!(
+                        "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10}",
+                        entry.payment_date.format_yyyy_mm_dd(),
+                        format_rate(entry.effective_annual_interest_rate_pct),
+                        money(entry.total_payment),
+                        money(entry.interest_payment),
+                        money(entry.principal_payment),
+                        money(entry.fees_payment),
+                    )
+                }
+                ScheduleDisplayRow::AprChangeMarker {
+                    effective_date,
+                    annual_interest_rate_pct,
+                    ..
+                } => {
+                    format!(
+                        "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10}",
+                        effective_date.format_yyyy_mm_dd(),
+                        format_rate(*annual_interest_rate_pct),
+                        "",
+                        "",
+                        "",
+                        "",
+                    )
+                }
+            };
 
             let style = if is_selected {
                 Style::default()
@@ -201,7 +212,7 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     let main_help = if app.is_row_rate_popup_open {
-        "APR popup: digits/. input | backspace: delete | enter: apply | d: clear | esc: cancel"
+        "APR popup: tab/up/down switch field | type | backspace | enter apply | d clear | esc cancel"
     } else {
         "up/down/j/k: navigate | tab/shift+tab: switch panels | enter on schedule: edit APR | space/enter: toggle | r: reset | q: quit"
     };
@@ -229,48 +240,67 @@ fn render_row_rate_popup(frame: &mut Frame, app: &App) {
     let popup_area = centered_rect(58, 34, frame.area());
     frame.render_widget(Clear, popup_area);
 
-    let selected_month = app.selected_month;
-    let selected_month_label = app.format_schedule_month(selected_month);
-    let selected_payment_date = app
-        .metrics
-        .as_ref()
-        .and_then(|metrics| metrics.repayment_schedule.get(app.schedule_selected_index))
-        .map(|entry| entry.payment_date.format_yyyy_mm_dd())
+    let selected_row = app.selected_schedule_row();
+    let row_date = selected_row.map(|row| row.date());
+    let row_date_display = row_date
+        .map(|date| date.format_yyyy_mm_dd())
         .unwrap_or_else(|| "--".to_string());
-    let effective = app
-        .metrics
-        .as_ref()
-        .and_then(|metrics| metrics.repayment_schedule.get(app.schedule_selected_index))
-        .map(|entry| entry.effective_annual_interest_rate_pct)
-        .or_else(|| app.effective_rate_for_month(selected_month));
+    let selected_row_label = match selected_row {
+        Some(ScheduleDisplayRow::Payment { month_index, .. }) => {
+            let month_label = app.format_schedule_month(month_index);
+            format!("Payment M{month_index} ({month_label})")
+        }
+        Some(ScheduleDisplayRow::AprChangeMarker { target_month, .. }) => {
+            format!("APR Change (targets M{target_month})")
+        }
+        None => "None".to_string(),
+    };
 
-    let effective_display = effective
+    let effective_display = row_date
+        .and_then(|date| app.effective_rate_for_date(date))
         .map(format_rate)
         .unwrap_or_else(|| "--".to_string());
-    let override_display = app
-        .override_for_month(selected_month)
+    let override_display = row_date
+        .and_then(|date| app.override_for_date(date))
         .map(format_rate)
         .unwrap_or_else(|| "--".to_string());
 
-    let input_display = if app.row_rate_input_buffer.is_empty() {
+    let date_marker = if app.row_rate_popup_active_field == RowRatePopupField::EffectiveDate {
+        ">"
+    } else {
+        " "
+    };
+    let apr_marker = if app.row_rate_popup_active_field == RowRatePopupField::Apr {
+        ">"
+    } else {
+        " "
+    };
+    let date_input_display = if app.row_rate_date_input_buffer.is_empty() {
         "<empty>".to_string()
     } else {
-        app.row_rate_input_buffer.clone()
+        app.row_rate_date_input_buffer.clone()
+    };
+    let apr_input_display = if app.row_rate_apr_input_buffer.is_empty() {
+        "<empty>".to_string()
+    } else {
+        app.row_rate_apr_input_buffer.clone()
     };
 
     let popup_lines = vec![
-        Line::from(format!(
-            "Selected Month: M{} ({selected_month_label})",
-            selected_month
-        )),
-        Line::from(format!("Payment Date:   {selected_payment_date}")),
+        Line::from(format!("Selected Row:   {selected_row_label}")),
+        Line::from(format!("Selected Date:  {row_date_display}")),
         Line::from(format!("Effective APR:  {effective_display}%")),
         Line::from(format!("Override APR:   {override_display}%")),
         Line::from(""),
-        Line::from(format!("APR Input: {input_display}")),
+        Line::from(format!(
+            "{date_marker} Effective Date Input: {date_input_display}"
+        )),
+        Line::from(format!(
+            "{apr_marker} APR Input:            {apr_input_display}"
+        )),
         Line::from(""),
         Line::styled(
-            "Enter apply | d clear | Esc cancel",
+            "Tab/Up/Down switch field | Enter apply | d clear | Esc cancel",
             Style::default().fg(Color::DarkGray),
         ),
     ];

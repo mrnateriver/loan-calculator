@@ -115,6 +115,8 @@ fn handle_row_rate_popup_key(app: &mut App, key_event: KeyEvent) {
     match key_event.code {
         KeyCode::Esc => app.close_row_rate_popup(),
         KeyCode::Enter => app.apply_row_rate_override_at_selected_month(),
+        KeyCode::Tab | KeyCode::Down => app.row_rate_popup_next_field(),
+        KeyCode::BackTab | KeyCode::Up => app.row_rate_popup_previous_field(),
         KeyCode::Backspace => app.row_rate_input_backspace(),
         KeyCode::Char('d') if key_event.modifiers.is_empty() => {
             app.clear_row_rate_override_at_selected_month()
