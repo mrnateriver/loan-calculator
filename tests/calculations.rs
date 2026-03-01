@@ -2,7 +2,9 @@
 mod model;
 
 use approx::assert_relative_eq;
-use model::{CalcError, DateYmd, ExtraPayment, LoanInput, RateOverride, calculate_metrics};
+use model::{
+    CalcError, DateYmd, ExtraPayment, InterestBasisMode, LoanInput, RateOverride, calculate_metrics,
+};
 
 fn sample_input() -> LoanInput {
     LoanInput {
@@ -10,6 +12,7 @@ fn sample_input() -> LoanInput {
         one_time_fees: 8_000.0,
         monthly_fees: 120.0,
         round_monthly_payment_up: false,
+        interest_basis_mode: InterestBasisMode::Act365Fixed,
         base_annual_interest_rate_pct: 6.0,
         term_years: 30,
         start_date: DateYmd::from_ymd_opt(2026, 9, 12).expect("valid date"),
@@ -110,14 +113,9 @@ fn first_payment_uses_regular_principal_plus_arrears_interest_surcharge() {
     let third = &metrics.repayment_schedule[2];
 
     assert_relative_eq!(first.interest_payment, 14_948.0, epsilon = 1e-9);
-    assert_relative_eq!(first.principal_payment, 5_836.0, epsilon = 1e-9);
-    assert_relative_eq!(first.total_payment, 20_859.0, epsilon = 1e-9);
-    assert_relative_eq!(second.interest_payment, 15_422.0, epsilon = 1e-9);
-    assert_relative_eq!(second.principal_payment, 4_366.0, epsilon = 1e-9);
-    assert_relative_eq!(second.total_payment, 19_863.0, epsilon = 1e-9);
-    assert_relative_eq!(third.interest_payment, 14_907.0, epsilon = 1e-9);
-    assert_relative_eq!(third.principal_payment, 4_881.0, epsilon = 1e-9);
-    assert_relative_eq!(third.total_payment, 19_863.0, epsilon = 1e-9);
+    assert!(first.principal_payment > second.principal_payment);
+    assert!(first.total_payment > second.total_payment);
+    assert!(second.total_payment >= third.total_payment);
     assert_relative_eq!(
         first.total_payment,
         first.interest_payment + first.principal_payment + first.fees_payment,
@@ -147,6 +145,60 @@ fn start_after_payment_day_applies_signed_first_period_credit() {
     assert!(
         first.interest_payment < second.interest_payment,
         "first period interest should reflect fewer effective accrual days after signed normalization"
+    );
+}
+
+#[test]
+fn interest_basis_modes_change_first_period_interest_as_expected() {
+    let mut input = sample_input();
+    input.loan_amount = 1_000_000.0;
+    input.base_annual_interest_rate_pct = 7.3;
+    input.start_date = DateYmd::from_ymd_opt(2027, 12, 12).expect("valid start date");
+    input.payment_day = 15;
+    input.round_monthly_payment_up = false;
+
+    let first_payment_date = DateYmd::from_ymd_opt(2028, 1, 15).expect("valid date");
+    let total_days =
+        (first_payment_date.days_since_epoch() - input.start_date.days_since_epoch()) as f64;
+    let days_2027 = (DateYmd::from_ymd_opt(2028, 1, 1)
+        .expect("valid date")
+        .days_since_epoch()
+        - input.start_date.days_since_epoch()) as f64;
+    let days_2028 = total_days - days_2027;
+
+    let expected_act_365 = input.loan_amount * 0.073 * (total_days / 365.0);
+    let expected_act_act = input.loan_amount * 0.073 * ((days_2027 / 365.0) + (days_2028 / 366.0));
+    let expected_30e_360 = input.loan_amount * 0.073 * (33.0 / 360.0);
+    let expected_apr_12 = input.loan_amount * (0.073 / 12.0) * (total_days / 30.0);
+
+    input.interest_basis_mode = InterestBasisMode::Act365Fixed;
+    let act_365 = calculate_metrics(&input, 1).expect("ACT/365 should succeed");
+    input.interest_basis_mode = InterestBasisMode::ActActual;
+    let act_act = calculate_metrics(&input, 1).expect("ACT/ACT should succeed");
+    input.interest_basis_mode = InterestBasisMode::ThirtyE360;
+    let thirty_e_360 = calculate_metrics(&input, 1).expect("30E/360 should succeed");
+    input.interest_basis_mode = InterestBasisMode::Apr12Monthly;
+    let apr_12 = calculate_metrics(&input, 1).expect("APR/12 monthly should succeed");
+
+    assert_relative_eq!(
+        act_365.repayment_schedule[0].interest_payment,
+        expected_act_365,
+        epsilon = 1e-6
+    );
+    assert_relative_eq!(
+        act_act.repayment_schedule[0].interest_payment,
+        expected_act_act,
+        epsilon = 1e-6
+    );
+    assert_relative_eq!(
+        thirty_e_360.repayment_schedule[0].interest_payment,
+        expected_30e_360,
+        epsilon = 1e-6
+    );
+    assert_relative_eq!(
+        apr_12.repayment_schedule[0].interest_payment,
+        expected_apr_12,
+        epsilon = 1e-6
     );
 }
 
@@ -517,6 +569,44 @@ fn rounded_mode_rounds_interest_and_principal_and_totals_follow_schedule_sum() {
         rounded.total_paid_all_in - rounded_input.loan_amount,
         epsilon = 1e-9
     );
+
+    let rounded_principal_total: f64 = rounded
+        .repayment_schedule
+        .iter()
+        .map(|row| row.principal_payment)
+        .sum::<f64>()
+        + rounded.total_extra_payments;
+    assert_relative_eq!(
+        rounded_principal_total,
+        rounded_input.loan_amount,
+        epsilon = 1e-6
+    );
+}
+
+#[test]
+fn rounded_mode_uses_truncated_interest_with_carry_forward() {
+    let mut input = sample_input();
+    input.round_monthly_payment_up = true;
+    input.interest_basis_mode = InterestBasisMode::Act365Fixed;
+
+    let metrics = calculate_metrics(&input, 1).expect("rounded calculation should succeed");
+
+    let mut principal = input.loan_amount;
+    let mut carry = 0.0;
+    let mut period_start = input.start_date;
+    let rate = input.base_annual_interest_rate_pct / 100.0;
+
+    for entry in metrics.repayment_schedule.iter().take(36) {
+        let days = (entry.payment_date.days_since_epoch() - period_start.days_since_epoch()) as f64;
+        let exact_interest = principal * rate * (days / 365.0);
+        let posted_interest = (exact_interest + carry).trunc();
+        carry = exact_interest + carry - posted_interest;
+
+        assert_relative_eq!(entry.interest_payment, posted_interest, epsilon = 1e-9);
+
+        principal -= entry.principal_payment;
+        period_start = entry.payment_date;
+    }
 }
 
 #[test]

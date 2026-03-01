@@ -16,8 +16,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let top_height = if content_area.height <= 3 {
         content_area.height
     } else {
-        // 8 content rows + 2 border rows.
-        10.min(content_area.height - 3)
+        // One line per input field + 2 border rows.
+        ((FieldId::ALL.len() as u16) + 2).min(content_area.height - 3)
     };
 
     let [top_area, schedule_area] =

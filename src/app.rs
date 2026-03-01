@@ -6,11 +6,12 @@ use std::{
 };
 
 use crate::model::{
-    DateYmd, ExtraPayment, LoanInput, LoanMetrics, RateOverride, calculate_metrics,
+    DateYmd, ExtraPayment, InterestBasisMode, LoanInput, LoanMetrics, RateOverride,
+    calculate_metrics,
 };
 
 const TEXT_FIELD_COUNT: usize = 7;
-const FIELD_COUNT: usize = 8;
+const FIELD_COUNT: usize = 9;
 #[cfg(not(test))]
 const STATE_FILE_PATH: &str = ".loan-calculator.json";
 
@@ -23,6 +24,7 @@ pub enum FieldId {
     TermYears,
     StartDate,
     PaymentDay,
+    InterestBasis,
     RoundPaymentsUp,
 }
 
@@ -35,6 +37,7 @@ impl FieldId {
         FieldId::TermYears,
         FieldId::StartDate,
         FieldId::PaymentDay,
+        FieldId::InterestBasis,
         FieldId::RoundPaymentsUp,
     ];
 
@@ -47,6 +50,7 @@ impl FieldId {
             FieldId::TermYears => "Term (years)",
             FieldId::StartDate => "Start Date (YYYY-MM-DD)",
             FieldId::PaymentDay => "Payment Day (1-31)",
+            FieldId::InterestBasis => "Interest Basis",
             FieldId::RoundPaymentsUp => "Round Payment To Nearest Integer",
         }
     }
@@ -60,7 +64,7 @@ impl FieldId {
     }
 
     pub fn is_text_input(self) -> bool {
-        !matches!(self, FieldId::RoundPaymentsUp)
+        !matches!(self, FieldId::InterestBasis | FieldId::RoundPaymentsUp)
     }
 
     pub fn index(self) -> usize {
@@ -72,7 +76,7 @@ impl FieldId {
             FieldId::TermYears => 4,
             FieldId::StartDate => 5,
             FieldId::PaymentDay => 6,
-            FieldId::RoundPaymentsUp => {
+            FieldId::InterestBasis | FieldId::RoundPaymentsUp => {
                 unreachable!("checkbox field does not map to text input")
             }
         }
@@ -148,6 +152,7 @@ pub struct App {
     pub row_rate_popup_active_field: RowRatePopupField,
     pub selected_month: u32,
     pub round_payments_up: bool,
+    pub interest_basis_mode: InterestBasisMode,
     pub focus_area: FocusArea,
     pub schedule_rows: Vec<ScheduleDisplayRow>,
     pub schedule_selected_index: usize,
@@ -171,6 +176,7 @@ impl Default for App {
             row_rate_popup_active_field: RowRatePopupField::EffectiveDate,
             selected_month: 1,
             round_payments_up: false,
+            interest_basis_mode: InterestBasisMode::Act365Fixed,
             focus_area: FocusArea::Inputs,
             schedule_rows: Vec::new(),
             schedule_selected_index: 0,
@@ -197,14 +203,16 @@ impl App {
     }
 
     pub fn field_display_value(&self, field: FieldId) -> String {
-        if field == FieldId::RoundPaymentsUp {
-            if self.round_payments_up {
-                "[x]".to_string()
-            } else {
-                "[ ]".to_string()
+        match field {
+            FieldId::InterestBasis => self.interest_basis_mode.label().to_string(),
+            FieldId::RoundPaymentsUp => {
+                if self.round_payments_up {
+                    "[x]".to_string()
+                } else {
+                    "[ ]".to_string()
+                }
             }
-        } else {
-            self.field_value(field).to_string()
+            _ => self.field_value(field).to_string(),
         }
     }
 
@@ -413,6 +421,12 @@ impl App {
         self.recalculate();
     }
 
+    pub fn cycle_interest_basis_mode(&mut self) {
+        self.interest_basis_mode = self.interest_basis_mode.next();
+        self.persist_state_silently();
+        self.recalculate();
+    }
+
     pub fn reset(&mut self) {
         self.inputs = default_inputs();
         self.active_field_idx = 0;
@@ -424,6 +438,7 @@ impl App {
         self.row_rate_popup_active_field = RowRatePopupField::EffectiveDate;
         self.selected_month = 1;
         self.round_payments_up = false;
+        self.interest_basis_mode = InterestBasisMode::Act365Fixed;
         self.focus_area = FocusArea::Inputs;
         self.schedule_rows.clear();
         self.schedule_selected_index = 0;
@@ -965,6 +980,11 @@ impl App {
             if let Some(round_flag) = extract_json_bool_value(&raw_state, "round_payments_up") {
                 self.round_payments_up = round_flag;
             }
+            if let Some(mode) = extract_json_string_value(&raw_state, "interest_basis_mode")
+                .and_then(|raw| InterestBasisMode::from_persisted_key(raw.trim()))
+            {
+                self.interest_basis_mode = mode;
+            }
 
             if let Some(overrides_obj) = extract_json_object_value(&raw_state, "rate_overrides") {
                 self.rate_overrides = parse_override_map_json(overrides_obj);
@@ -1026,6 +1046,10 @@ impl App {
             } else {
                 "false"
             }
+        ));
+        json.push_str(&format!(
+            "  \"interest_basis_mode\": \"{}\",\n",
+            self.interest_basis_mode.persisted_key()
         ));
         json.push_str("  \"rate_overrides\": {\n");
 
@@ -1094,6 +1118,7 @@ impl App {
             one_time_fees,
             monthly_fees,
             round_monthly_payment_up: self.round_payments_up,
+            interest_basis_mode: self.interest_basis_mode,
             base_annual_interest_rate_pct,
             term_years,
             start_date,
@@ -1379,7 +1404,7 @@ fn last_day_of_month(year: i32, month: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{App, ScheduleDisplayRow};
-    use crate::model::DateYmd;
+    use crate::model::{DateYmd, InterestBasisMode};
 
     #[test]
     fn term_reduction_prunes_overrides_and_clamps_selected_month() {
@@ -1609,5 +1634,23 @@ mod tests {
 
         app.toggle_round_payments_up();
         assert!(!app.round_payments_up);
+    }
+
+    #[test]
+    fn cycling_interest_basis_advances_modes() {
+        let mut app = App::default();
+        assert_eq!(app.interest_basis_mode, InterestBasisMode::Act365Fixed);
+
+        app.cycle_interest_basis_mode();
+        assert_eq!(app.interest_basis_mode, InterestBasisMode::ActActual);
+
+        app.cycle_interest_basis_mode();
+        assert_eq!(app.interest_basis_mode, InterestBasisMode::ThirtyE360);
+
+        app.cycle_interest_basis_mode();
+        assert_eq!(app.interest_basis_mode, InterestBasisMode::Apr12Monthly);
+
+        app.cycle_interest_basis_mode();
+        assert_eq!(app.interest_basis_mode, InterestBasisMode::Act365Fixed);
     }
 }

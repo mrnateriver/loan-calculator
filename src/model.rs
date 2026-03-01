@@ -72,6 +72,53 @@ pub struct ExtraPayment {
     pub amount: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterestBasisMode {
+    Act365Fixed,
+    ActActual,
+    ThirtyE360,
+    Apr12Monthly,
+}
+
+impl InterestBasisMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            InterestBasisMode::Act365Fixed => "ACT/365",
+            InterestBasisMode::ActActual => "ACT/ACT",
+            InterestBasisMode::ThirtyE360 => "30E/360",
+            InterestBasisMode::Apr12Monthly => "APR/12 monthly",
+        }
+    }
+
+    pub fn persisted_key(self) -> &'static str {
+        match self {
+            InterestBasisMode::Act365Fixed => "act_365",
+            InterestBasisMode::ActActual => "act_act",
+            InterestBasisMode::ThirtyE360 => "30e_360",
+            InterestBasisMode::Apr12Monthly => "apr_12_monthly",
+        }
+    }
+
+    pub fn from_persisted_key(value: &str) -> Option<Self> {
+        match value {
+            "act_365" => Some(InterestBasisMode::Act365Fixed),
+            "act_act" => Some(InterestBasisMode::ActActual),
+            "30e_360" => Some(InterestBasisMode::ThirtyE360),
+            "apr_12_monthly" => Some(InterestBasisMode::Apr12Monthly),
+            _ => None,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            InterestBasisMode::Act365Fixed => InterestBasisMode::ActActual,
+            InterestBasisMode::ActActual => InterestBasisMode::ThirtyE360,
+            InterestBasisMode::ThirtyE360 => InterestBasisMode::Apr12Monthly,
+            InterestBasisMode::Apr12Monthly => InterestBasisMode::Act365Fixed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PaymentSegment {
     pub start_month: u32,
@@ -103,6 +150,7 @@ pub struct LoanInput {
     pub one_time_fees: f64,
     pub monthly_fees: f64,
     pub round_monthly_payment_up: bool,
+    pub interest_basis_mode: InterestBasisMode,
     pub base_annual_interest_rate_pct: f64,
     pub term_years: u32,
     pub start_date: DateYmd,
@@ -165,12 +213,6 @@ pub enum CalcError {
     InvalidSelectedMonth { month: u32, max_month: u32 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DayCountConvention {
-    Actual365Fixed,
-    ActualActual,
-}
-
 pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanMetrics, CalcError> {
     validate_non_negative("one_time_fees", input.one_time_fees)?;
     validate_non_negative("monthly_fees", input.monthly_fees)?;
@@ -217,11 +259,7 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
         normalize_rate_overrides(&input.rate_overrides, input.start_date, last_payment_date)?;
     let extra_payments =
         normalize_extra_payments(&input.extra_payments, input.start_date, last_payment_date)?;
-    let day_count = if input.round_monthly_payment_up {
-        DayCountConvention::ActualActual
-    } else {
-        DayCountConvention::Actual365Fixed
-    };
+    let interest_basis_mode = input.interest_basis_mode;
 
     let mut remaining_principal = input.loan_amount;
     let mut segments = Vec::with_capacity(rate_overrides.len() + extra_payments.len() + 1);
@@ -232,6 +270,7 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
     let mut current_monthly_payment_base = 0.0_f64;
     let mut has_active_segment = false;
     let mut recompute_monthly_payment_at_month_start = false;
+    let mut rounded_interest_carry = 0.0_f64;
 
     apply_extra_payment_on_date(
         &mut remaining_principal,
@@ -263,7 +302,7 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
                         &rate_overrides,
                         &extra_payments,
                         &mut applied_extra_payments,
-                        day_count,
+                        interest_basis_mode,
                     );
                 principal_for_regular_period = principal_after_arrears;
                 arrears_interest_signed = arrears_interest;
@@ -284,7 +323,7 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
                     input.start_date,
                     input.base_annual_interest_rate_pct,
                     &rate_overrides,
-                    day_count,
+                    interest_basis_mode,
                 );
             }
         }
@@ -298,7 +337,7 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
                 &rate_overrides,
                 &extra_payments,
                 &mut applied_extra_payments,
-                day_count,
+                interest_basis_mode,
             );
         had_extra_payment_before_scheduled_payment |= had_regular_extra_payment;
 
@@ -341,6 +380,7 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
                     month,
                     &payment_dates,
                     current_segment_rate,
+                    interest_basis_mode,
                 );
             }
             has_active_segment = true;
@@ -349,12 +389,23 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
         let total_interest_payment = interest_payment + arrears_interest_signed;
         let (
             interest_payment_for_schedule,
-            principal_payment_for_schedule,
+            mut principal_payment_for_schedule,
             principal_payment_for_ledger,
         ) = if input.round_monthly_payment_up {
+            let interest_with_carry = total_interest_payment + rounded_interest_carry;
+            let total_interest_posted = round_down_towards_zero(interest_with_carry);
+            rounded_interest_carry = interest_with_carry - total_interest_posted;
+            if rounded_interest_carry.abs() < 1e-12 {
+                rounded_interest_carry = 0.0;
+            }
+
             let regular_interest_posted = round_down_towards_zero(interest_payment);
-            let total_interest_posted = round_down_towards_zero(total_interest_payment);
-            let mut principal_posted = current_monthly_payment_base - regular_interest_posted;
+            let mut principal_posted = if month == 1 {
+                // First month carries the signed arrears adjustment in payment amount.
+                current_monthly_payment_base - regular_interest_posted
+            } else {
+                current_monthly_payment_base - total_interest_posted
+            };
             if principal_posted < 0.0 {
                 principal_posted = 0.0;
             }
@@ -375,6 +426,10 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
 
         remaining_principal = principal_before_scheduled_payment - principal_payment_for_ledger;
         if remaining_principal.abs() < 1e-8 {
+            remaining_principal = 0.0;
+        }
+        if month == total_months && remaining_principal > 1e-8 {
+            principal_payment_for_schedule += remaining_principal;
             remaining_principal = 0.0;
         }
 
@@ -590,7 +645,7 @@ fn simulate_period_daily_with_events(
     rate_overrides: &BTreeMap<DateYmd, f64>,
     extra_payments: &BTreeMap<DateYmd, f64>,
     applied_extra_payments: &mut Vec<AppliedExtraPaymentEntry>,
-    day_count: DayCountConvention,
+    interest_basis_mode: InterestBasisMode,
 ) -> (f64, f64, bool) {
     if period_end <= period_start {
         return (0.0, principal_start, false);
@@ -630,7 +685,7 @@ fn simulate_period_daily_with_events(
             cursor,
             segment_end,
             segment_rate,
-            day_count,
+            interest_basis_mode,
         );
 
         if segment_end >= period_end {
@@ -673,7 +728,7 @@ fn accrue_interest_for_period_daily(
     period_end: DateYmd,
     base_annual_interest_rate_pct: f64,
     rate_overrides: &BTreeMap<DateYmd, f64>,
-    day_count: DayCountConvention,
+    interest_basis_mode: InterestBasisMode,
 ) -> f64 {
     if period_end <= period_start {
         return 0.0;
@@ -689,8 +744,13 @@ fn accrue_interest_for_period_daily(
             continue;
         }
 
-        interest +=
-            accrue_interest_with_day_count(principal, segment_start, *change_date, segment_rate, day_count);
+        interest += accrue_interest_with_day_count(
+            principal,
+            segment_start,
+            *change_date,
+            segment_rate,
+            interest_basis_mode,
+        );
 
         segment_start = *change_date;
         segment_rate = *override_rate;
@@ -701,7 +761,7 @@ fn accrue_interest_for_period_daily(
         segment_start,
         period_end,
         segment_rate,
-        day_count,
+        interest_basis_mode,
     );
     interest
 }
@@ -711,18 +771,18 @@ fn accrue_interest_with_day_count(
     from: DateYmd,
     to: DateYmd,
     annual_rate_pct: f64,
-    day_count: DayCountConvention,
+    interest_basis_mode: InterestBasisMode,
 ) -> f64 {
     if to <= from || principal <= 0.0 || annual_rate_pct == 0.0 {
         return 0.0;
     }
 
-    match day_count {
-        DayCountConvention::Actual365Fixed => {
+    match interest_basis_mode {
+        InterestBasisMode::Act365Fixed => {
             let days = (to.days_since_epoch() - from.days_since_epoch()).max(0) as f64;
             principal * (annual_rate_pct / 100.0) * (days / 365.0)
         }
-        DayCountConvention::ActualActual => {
+        InterestBasisMode::ActActual => {
             let mut interest = 0.0;
             let mut cursor = from;
             while cursor < to {
@@ -735,11 +795,23 @@ fn accrue_interest_with_day_count(
                 };
                 let segment_days =
                     (segment_end.days_since_epoch() - cursor.days_since_epoch()).max(0) as f64;
-                let denominator = if is_leap_year(cursor.year) { 366.0 } else { 365.0 };
+                let denominator = if is_leap_year(cursor.year) {
+                    366.0
+                } else {
+                    365.0
+                };
                 interest += principal * (annual_rate_pct / 100.0) * (segment_days / denominator);
                 cursor = segment_end;
             }
             interest
+        }
+        InterestBasisMode::ThirtyE360 => {
+            let days_30e_360 = day_count_30e_360(from, to) as f64;
+            principal * (annual_rate_pct / 100.0) * (days_30e_360 / 360.0)
+        }
+        InterestBasisMode::Apr12Monthly => {
+            let actual_days = (to.days_since_epoch() - from.days_since_epoch()).max(0) as f64;
+            principal * (annual_rate_pct / 100.0 / 12.0) * (actual_days / 30.0)
         }
     }
 }
@@ -800,6 +872,7 @@ fn solve_monthly_payment_base_daily(
     current_month: u32,
     payment_dates: &[DateYmd],
     annual_interest_rate_pct: f64,
+    interest_basis_mode: InterestBasisMode,
 ) -> f64 {
     if principal_before_current_payment <= 0.0 {
         return 0.0;
@@ -812,6 +885,7 @@ fn solve_monthly_payment_base_daily(
         current_month,
         payment_dates,
         annual_interest_rate_pct,
+        interest_basis_mode,
     );
     if residual_at_zero <= 1e-8 {
         return 0.0;
@@ -826,6 +900,7 @@ fn solve_monthly_payment_base_daily(
         current_month,
         payment_dates,
         annual_interest_rate_pct,
+        interest_basis_mode,
     );
 
     let mut expansion_steps = 0;
@@ -838,6 +913,7 @@ fn solve_monthly_payment_base_daily(
             current_month,
             payment_dates,
             annual_interest_rate_pct,
+            interest_basis_mode,
         );
         expansion_steps += 1;
     }
@@ -855,6 +931,7 @@ fn solve_monthly_payment_base_daily(
             current_month,
             payment_dates,
             annual_interest_rate_pct,
+            interest_basis_mode,
         );
         if residual > 1e-8 {
             low = mid;
@@ -873,6 +950,7 @@ fn remaining_principal_after_constant_payment_base(
     current_month: u32,
     payment_dates: &[DateYmd],
     annual_interest_rate_pct: f64,
+    interest_basis_mode: InterestBasisMode,
 ) -> f64 {
     let total_months = payment_dates.len() as u32;
     let mut principal = principal_before_current_payment.max(0.0);
@@ -883,9 +961,13 @@ fn remaining_principal_after_constant_payment_base(
         } else {
             let period_start = payment_dates[(month - 2) as usize];
             let period_end = payment_dates[(month - 1) as usize];
-            let days =
-                (period_end.days_since_epoch() - period_start.days_since_epoch()).max(0) as f64;
-            principal * (annual_interest_rate_pct / 100.0) * (days / 365.0)
+            accrue_interest_with_day_count(
+                principal,
+                period_start,
+                period_end,
+                annual_interest_rate_pct,
+                interest_basis_mode,
+            )
         };
 
         let mut principal_payment = monthly_payment_base - interest_payment;
@@ -906,11 +988,31 @@ fn remaining_principal_after_constant_payment_base(
 }
 
 fn round_half_up(value: f64) -> f64 {
-    value.round()
+    if !value.is_finite() {
+        return value;
+    }
+    if value >= 0.0 {
+        (value + 0.5).floor()
+    } else {
+        (value - 0.5).ceil()
+    }
 }
 
 fn round_down_towards_zero(value: f64) -> f64 {
     value.trunc()
+}
+
+fn day_count_30e_360(from: DateYmd, to: DateYmd) -> i64 {
+    let y1 = from.year as i64;
+    let m1 = from.month as i64;
+    let d1 = from.day.min(30) as i64;
+
+    let y2 = to.year as i64;
+    let m2 = to.month as i64;
+    let d2 = to.day.min(30) as i64;
+
+    let days = 360 * (y2 - y1) + 30 * (m2 - m1) + (d2 - d1);
+    days.max(0)
 }
 
 fn validate_non_negative(field: &'static str, value: f64) -> Result<(), CalcError> {

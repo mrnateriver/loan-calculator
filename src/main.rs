@@ -92,11 +92,21 @@ fn handle_main_key(app: &mut App, key_event: KeyEvent) {
         {
             app.toggle_round_payments_up()
         }
+        KeyCode::Char(' ')
+            if !app.is_schedule_focused() && app.active_field() == FieldId::InterestBasis =>
+        {
+            app.cycle_interest_basis_mode()
+        }
         KeyCode::Enter if app.is_schedule_focused() => app.open_row_rate_popup(),
         KeyCode::Enter
             if !app.is_schedule_focused() && app.active_field() == FieldId::RoundPaymentsUp =>
         {
             app.toggle_round_payments_up()
+        }
+        KeyCode::Enter
+            if !app.is_schedule_focused() && app.active_field() == FieldId::InterestBasis =>
+        {
+            app.cycle_interest_basis_mode()
         }
         KeyCode::Enter => app.recalculate(),
         KeyCode::Backspace if !app.is_schedule_focused() => app.backspace(),
