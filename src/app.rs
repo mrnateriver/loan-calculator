@@ -51,7 +51,7 @@ impl FieldId {
             FieldId::StartDate => "Start Date (YYYY-MM-DD)",
             FieldId::PaymentDay => "Payment Day (1-31)",
             FieldId::InterestBasis => "Interest Basis",
-            FieldId::RoundPaymentsUp => "Round Payment To Nearest Integer",
+            FieldId::RoundPaymentsUp => "Integer Payments",
         }
     }
 

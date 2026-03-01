@@ -40,25 +40,25 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_form(frame: &mut Frame, app: &App, area: Rect) {
+    let row_width = area.width.saturating_sub(2) as usize;
     let mut lines = Vec::with_capacity(FieldId::ALL.len());
 
     for field in FieldId::ALL {
         let is_active = field == app.active_field() && !app.is_any_popup_open();
-        let marker = if is_active { ">" } else { " " };
         let value = app.field_display_value(field);
+        let row_text = format!("{:<28} {}", format!("{}:", field.label()), value);
+        let padded_row = format!("{:<width$}", row_text, width = row_width);
 
         let style = if is_active {
             Style::default()
-                .fg(Color::Yellow)
+                .fg(Color::Black)
+                .bg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
 
-        lines.push(Line::styled(
-            format!("{} {:<28} {}", marker, format!("{}:", field.label()), value),
-            style,
-        ));
+        lines.push(Line::styled(padded_row, style));
     }
 
     let form = Paragraph::new(Text::from(lines))
@@ -75,7 +75,7 @@ fn render_form(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_summary(frame: &mut Frame, app: &App, area: Rect) {
     let lines = match app.metrics.as_ref() {
-        Some(metrics) => summary_lines(metrics),
+        Some(metrics) => summary_lines(metrics, app.round_payments_up),
         None => vec![Line::from("Press Enter after filling valid values.")],
     };
 
@@ -140,10 +140,10 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
                         "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10}",
                         entry.payment_date.format_yyyy_mm_dd(),
                         format_rate(entry.effective_annual_interest_rate_pct),
-                        money(entry.total_payment),
-                        money(entry.interest_payment),
-                        money(entry.principal_payment),
-                        money(entry.fees_payment),
+                        money(entry.total_payment, app.round_payments_up),
+                        money(entry.interest_payment, app.round_payments_up),
+                        money(entry.principal_payment, app.round_payments_up),
+                        money(entry.fees_payment, app.round_payments_up),
                     )
                 }
                 ScheduleDisplayRow::AprChangeMarker {
@@ -170,7 +170,7 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
                         "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10}",
                         effective_date.format_yyyy_mm_dd(),
                         "",
-                        money(*amount),
+                        money(*amount, app.round_payments_up),
                         "",
                         "",
                         "",
@@ -280,7 +280,7 @@ fn render_row_rate_popup(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| "--".to_string());
     let extra_display = row_date
         .and_then(|date| app.extra_payment_for_date(date))
-        .map(money)
+        .map(|value| money(value, app.round_payments_up))
         .unwrap_or_else(|| "--".to_string());
 
     let date_marker = if app.row_rate_popup_active_field == RowRatePopupField::EffectiveDate {
@@ -401,12 +401,14 @@ fn render_interest_basis_popup(frame: &mut Frame, app: &App) {
     frame.render_widget(footer, footer_area);
 }
 
-fn summary_lines(metrics: &LoanMetrics) -> Vec<Line<'static>> {
+fn summary_lines(metrics: &LoanMetrics, hide_zero_fraction: bool) -> Vec<Line<'static>> {
     let next_change = match (
         metrics.next_change_month,
         metrics.next_change_monthly_payment_base,
     ) {
-        (Some(month), Some(payment)) => format!("M{month} -> {}", money(payment)),
+        (Some(month), Some(payment)) => {
+            format!("M{month} -> {}", money(payment, hide_zero_fraction))
+        }
         _ => "None".to_string(),
     };
 
@@ -414,25 +416,66 @@ fn summary_lines(metrics: &LoanMetrics) -> Vec<Line<'static>> {
         Line::from(format!("Next Change:                      {}", next_change)),
         Line::from(format!(
             "Total Interest:                   {}",
-            money(metrics.total_interest)
+            money(metrics.total_interest, hide_zero_fraction)
         )),
         Line::from(format!(
             "Total Extra Payments:             {}",
-            money(metrics.total_extra_payments)
+            money(metrics.total_extra_payments, hide_zero_fraction)
         )),
         Line::from(format!(
             "Total Repayment:                  {}",
-            money(metrics.total_repayment)
+            money(metrics.total_repayment, hide_zero_fraction)
         )),
         Line::from(format!(
             "Loan Cost:                        {}",
-            money(metrics.loan_cost)
+            money(metrics.loan_cost, hide_zero_fraction)
         )),
     ]
 }
 
-fn money(value: f64) -> String {
-    format!("{value:.2}")
+fn money(value: f64, hide_zero_fraction: bool) -> String {
+    let formatted = format!("{value:.2}");
+    let (sign, unsigned) = match formatted.strip_prefix('-') {
+        Some(stripped) => ("-", stripped),
+        None => ("", formatted.as_str()),
+    };
+
+    let (integer_part, fractional_part) = match unsigned.split_once('.') {
+        Some((int_part, frac_part)) => (int_part, Some(frac_part)),
+        None => (unsigned, None),
+    };
+    let grouped_integer = group_triads(integer_part);
+
+    if hide_zero_fraction && fractional_part == Some("00") {
+        format!("{sign}{grouped_integer}")
+    } else if let Some(frac_part) = fractional_part {
+        format!("{sign}{grouped_integer}.{frac_part}")
+    } else {
+        format!("{sign}{grouped_integer}")
+    }
+}
+
+fn group_triads(digits: &str) -> String {
+    if digits.len() <= 3 || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return digits.to_string();
+    }
+
+    let len = digits.len();
+    let mut out = String::with_capacity(len + ((len - 1) / 3));
+    let mut first_group_len = len % 3;
+    if first_group_len == 0 {
+        first_group_len = 3;
+    }
+
+    out.push_str(&digits[..first_group_len]);
+    let mut idx = first_group_len;
+    while idx < len {
+        out.push(' ');
+        out.push_str(&digits[idx..idx + 3]);
+        idx += 3;
+    }
+
+    out
 }
 
 fn format_rate(value: f64) -> String {
