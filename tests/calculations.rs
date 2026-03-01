@@ -2,7 +2,7 @@
 mod model;
 
 use approx::assert_relative_eq;
-use model::{CalcError, DateYmd, LoanInput, RateOverride, calculate_metrics};
+use model::{CalcError, DateYmd, ExtraPayment, LoanInput, RateOverride, calculate_metrics};
 
 fn sample_input() -> LoanInput {
     LoanInput {
@@ -15,6 +15,7 @@ fn sample_input() -> LoanInput {
         start_date: DateYmd::from_ymd_opt(2026, 9, 12).expect("valid date"),
         payment_day: 15,
         rate_overrides: vec![],
+        extra_payments: vec![],
     }
 }
 
@@ -93,11 +94,11 @@ fn payment_day_clamps_to_last_day_for_short_months() {
 #[test]
 fn first_payment_uses_regular_principal_plus_arrears_interest_surcharge() {
     let mut input = sample_input();
-    input.loan_amount = 4_204_720.0;
-    input.monthly_fees = 60.0;
-    input.base_annual_interest_rate_pct = 5.24;
-    input.start_date = DateYmd::from_ymd_opt(2025, 9, 12).expect("valid start date");
-    input.payment_day = 15;
+    input.loan_amount = 3_750_000.0;
+    input.monthly_fees = 75.0;
+    input.base_annual_interest_rate_pct = 4.85;
+    input.start_date = DateYmd::from_ymd_opt(2027, 2, 18).expect("valid start date");
+    input.payment_day = 20;
     input.round_monthly_payment_up = true;
 
     let metrics = calculate_metrics(&input, 1).expect("calculation should succeed");
@@ -106,10 +107,17 @@ fn first_payment_uses_regular_principal_plus_arrears_interest_surcharge() {
         .first()
         .expect("schedule should include first payment");
     let second = &metrics.repayment_schedule[1];
+    let third = &metrics.repayment_schedule[2];
 
-    assert_relative_eq!(first.interest_payment, 19_920.0, epsilon = 1e-9);
-    assert_relative_eq!(first.principal_payment, 5_083.0, epsilon = 1e-9);
-    assert_relative_eq!(first.total_payment, 25_063.0, epsilon = 1e-9);
+    assert_relative_eq!(first.interest_payment, 14_948.0, epsilon = 1e-9);
+    assert_relative_eq!(first.principal_payment, 5_836.0, epsilon = 1e-9);
+    assert_relative_eq!(first.total_payment, 20_859.0, epsilon = 1e-9);
+    assert_relative_eq!(second.interest_payment, 15_422.0, epsilon = 1e-9);
+    assert_relative_eq!(second.principal_payment, 4_366.0, epsilon = 1e-9);
+    assert_relative_eq!(second.total_payment, 19_863.0, epsilon = 1e-9);
+    assert_relative_eq!(third.interest_payment, 14_907.0, epsilon = 1e-9);
+    assert_relative_eq!(third.principal_payment, 4_881.0, epsilon = 1e-9);
+    assert_relative_eq!(third.total_payment, 19_863.0, epsilon = 1e-9);
     assert_relative_eq!(
         first.total_payment,
         first.interest_payment + first.principal_payment + first.fees_payment,
@@ -508,5 +516,120 @@ fn rounded_mode_rounds_interest_and_principal_and_totals_follow_schedule_sum() {
         rounded.loan_cost,
         rounded.total_paid_all_in - rounded_input.loan_amount,
         epsilon = 1e-9
+    );
+}
+
+#[test]
+fn extra_payment_between_due_dates_recalculates_next_scheduled_payment() {
+    let baseline = calculate_metrics(&sample_input(), 2).expect("baseline should succeed");
+
+    let mut with_extra = sample_input();
+    with_extra.extra_payments = vec![ExtraPayment {
+        effective_date: DateYmd::from_ymd_opt(2026, 11, 1).expect("valid date"),
+        amount: 10_000.0,
+    }];
+
+    let metrics = calculate_metrics(&with_extra, 2).expect("calculation should succeed");
+    let baseline_month_two = &baseline.repayment_schedule[1];
+    let month_two = &metrics.repayment_schedule[1];
+
+    assert_eq!(metrics.applied_extra_payments.len(), 1);
+    assert_eq!(
+        metrics.applied_extra_payments[0].effective_date,
+        DateYmd::from_ymd_opt(2026, 11, 1).expect("valid date")
+    );
+    assert_relative_eq!(
+        metrics.applied_extra_payments[0].applied_amount,
+        10_000.0,
+        epsilon = 1e-9
+    );
+    assert_relative_eq!(metrics.total_extra_payments, 10_000.0, epsilon = 1e-9);
+    assert!(
+        month_two.total_payment < baseline_month_two.total_payment,
+        "next scheduled payment should be recalculated after extra principal prepayment"
+    );
+    assert!(
+        month_two.interest_payment < baseline_month_two.interest_payment,
+        "daily interest should drop after principal is reduced mid-cycle"
+    );
+}
+
+#[test]
+fn extra_payment_on_payment_date_applies_after_scheduled_payment() {
+    let baseline = calculate_metrics(&sample_input(), 2).expect("baseline should succeed");
+    let first_payment_date = baseline.repayment_schedule[0].payment_date;
+
+    let mut with_extra = sample_input();
+    with_extra.extra_payments = vec![ExtraPayment {
+        effective_date: first_payment_date,
+        amount: 5_000.0,
+    }];
+
+    let metrics = calculate_metrics(&with_extra, 2).expect("calculation should succeed");
+
+    assert_relative_eq!(
+        metrics.repayment_schedule[0].total_payment,
+        baseline.repayment_schedule[0].total_payment,
+        epsilon = 1e-6
+    );
+    assert!(
+        metrics.repayment_schedule[1].total_payment < baseline.repayment_schedule[1].total_payment,
+        "payment-date extra should impact following scheduled payment, not current one"
+    );
+    assert_relative_eq!(metrics.total_extra_payments, 5_000.0, epsilon = 1e-9);
+}
+
+#[test]
+fn duplicate_extra_payment_dates_are_summed() {
+    let mut input = sample_input();
+    let date = DateYmd::from_ymd_opt(2026, 11, 1).expect("valid date");
+    input.extra_payments = vec![
+        ExtraPayment {
+            effective_date: date,
+            amount: 1_500.0,
+        },
+        ExtraPayment {
+            effective_date: date,
+            amount: 2_500.0,
+        },
+    ];
+
+    let metrics = calculate_metrics(&input, 2).expect("calculation should succeed");
+    assert_eq!(metrics.applied_extra_payments.len(), 1);
+    assert_relative_eq!(
+        metrics.applied_extra_payments[0].applied_amount,
+        4_000.0,
+        epsilon = 1e-9
+    );
+    assert_relative_eq!(metrics.total_extra_payments, 4_000.0, epsilon = 1e-9);
+}
+
+#[test]
+fn rejects_invalid_extra_payment_inputs() {
+    let mut before_start = sample_input();
+    before_start.extra_payments = vec![ExtraPayment {
+        effective_date: DateYmd::from_ymd_opt(2026, 9, 1).expect("valid date"),
+        amount: 1_000.0,
+    }];
+    let err = calculate_metrics(&before_start, 1).expect_err("should reject extra payment date");
+    assert_eq!(
+        err,
+        CalcError::InvalidExtraPaymentDate {
+            date: DateYmd::from_ymd_opt(2026, 9, 1).expect("valid date"),
+            min_date: before_start.start_date,
+            max_date: DateYmd::from_ymd_opt(2056, 9, 15).expect("valid end date"),
+        }
+    );
+
+    let mut negative = sample_input();
+    let valid_date = DateYmd::from_ymd_opt(2026, 11, 1).expect("valid date");
+    negative.extra_payments = vec![ExtraPayment {
+        effective_date: valid_date,
+        amount: -5.0,
+    }];
+    let err = calculate_metrics(&negative, 1).expect_err("should reject negative amount");
+    assert_eq!(
+        err,
+        CalcError::InvalidExtraPaymentAmount { date: valid_date }
     );
 }

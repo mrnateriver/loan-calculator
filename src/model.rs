@@ -67,6 +67,12 @@ pub struct RateOverride {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExtraPayment {
+    pub effective_date: DateYmd,
+    pub amount: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PaymentSegment {
     pub start_month: u32,
     pub end_month: u32,
@@ -85,6 +91,12 @@ pub struct RepaymentScheduleEntry {
     pub fees_payment: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AppliedExtraPaymentEntry {
+    pub effective_date: DateYmd,
+    pub applied_amount: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct LoanInput {
     pub loan_amount: f64,
@@ -96,6 +108,7 @@ pub struct LoanInput {
     pub start_date: DateYmd,
     pub payment_day: u32,
     pub rate_overrides: Vec<RateOverride>,
+    pub extra_payments: Vec<ExtraPayment>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +129,8 @@ pub struct LoanMetrics {
     pub down_payment_ratio_pct: f64,
     pub segments: Vec<PaymentSegment>,
     pub repayment_schedule: Vec<RepaymentScheduleEntry>,
+    pub applied_extra_payments: Vec<AppliedExtraPaymentEntry>,
+    pub total_extra_payments: f64,
 }
 
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -138,8 +153,22 @@ pub enum CalcError {
     DuplicateOverrideDate(DateYmd),
     #[error("rate override APR for date {date} must be a finite number >= 0")]
     InvalidOverrideRate { date: DateYmd },
+    #[error("extra payment date {date} is out of range ({min_date}..={max_date})")]
+    InvalidExtraPaymentDate {
+        date: DateYmd,
+        min_date: DateYmd,
+        max_date: DateYmd,
+    },
+    #[error("extra payment amount for date {date} must be a finite number >= 0")]
+    InvalidExtraPaymentAmount { date: DateYmd },
     #[error("selected month {month} is out of range (1..={max_month})")]
     InvalidSelectedMonth { month: u32, max_month: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DayCountConvention {
+    Actual365Fixed,
+    ActualActual,
 }
 
 pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanMetrics, CalcError> {
@@ -186,18 +215,30 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
     .expect("start-month anchor date must be valid");
     let rate_overrides =
         normalize_rate_overrides(&input.rate_overrides, input.start_date, last_payment_date)?;
+    let extra_payments =
+        normalize_extra_payments(&input.extra_payments, input.start_date, last_payment_date)?;
+    let day_count = if input.round_monthly_payment_up {
+        DayCountConvention::ActualActual
+    } else {
+        DayCountConvention::Actual365Fixed
+    };
 
     let mut remaining_principal = input.loan_amount;
-    let mut segments = Vec::with_capacity(rate_overrides.len() + 1);
+    let mut segments = Vec::with_capacity(rate_overrides.len() + extra_payments.len() + 1);
     let mut repayment_schedule = Vec::with_capacity(total_months as usize);
-    let mut current_segment_start_month = 1;
-    let mut current_segment_rate = rate_at_date(
-        payment_dates[0],
-        input.base_annual_interest_rate_pct,
-        &rate_overrides,
+    let mut applied_extra_payments = Vec::new();
+    let mut current_segment_start_month = 1_u32;
+    let mut current_segment_rate = 0.0_f64;
+    let mut current_monthly_payment_base = 0.0_f64;
+    let mut has_active_segment = false;
+    let mut recompute_monthly_payment_at_month_start = false;
+
+    apply_extra_payment_on_date(
+        &mut remaining_principal,
+        input.start_date,
+        &extra_payments,
+        &mut applied_extra_payments,
     );
-    let mut current_monthly_payment_base =
-        compute_monthly_payment(remaining_principal, current_segment_rate, total_months);
 
     for month in 1..=total_months {
         let payment_date = payment_dates[(month - 1) as usize];
@@ -207,69 +248,145 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
             payment_dates[(month - 2) as usize]
         };
 
+        let mut principal_for_regular_period = remaining_principal;
+        let mut arrears_interest_signed = 0.0_f64;
+        let mut had_extra_payment_before_scheduled_payment = false;
+
+        if month == 1 {
+            if input.start_date <= start_month_anchor {
+                let (arrears_interest, principal_after_arrears, had_arrears_extra_payment) =
+                    simulate_period_daily_with_events(
+                        principal_for_regular_period,
+                        input.start_date,
+                        start_month_anchor,
+                        input.base_annual_interest_rate_pct,
+                        &rate_overrides,
+                        &extra_payments,
+                        &mut applied_extra_payments,
+                        day_count,
+                    );
+                principal_for_regular_period = principal_after_arrears;
+                arrears_interest_signed = arrears_interest;
+                had_extra_payment_before_scheduled_payment |= had_arrears_extra_payment;
+
+                if apply_extra_payment_on_date(
+                    &mut principal_for_regular_period,
+                    start_month_anchor,
+                    &extra_payments,
+                    &mut applied_extra_payments,
+                ) {
+                    had_extra_payment_before_scheduled_payment = true;
+                }
+            } else {
+                arrears_interest_signed = -accrue_interest_for_period_daily(
+                    principal_for_regular_period,
+                    start_month_anchor,
+                    input.start_date,
+                    input.base_annual_interest_rate_pct,
+                    &rate_overrides,
+                    day_count,
+                );
+            }
+        }
+
+        let (interest_payment, principal_before_scheduled_payment, had_regular_extra_payment) =
+            simulate_period_daily_with_events(
+                principal_for_regular_period,
+                regular_period_start,
+                payment_date,
+                input.base_annual_interest_rate_pct,
+                &rate_overrides,
+                &extra_payments,
+                &mut applied_extra_payments,
+                day_count,
+            );
+        had_extra_payment_before_scheduled_payment |= had_regular_extra_payment;
+
         let payment_rate = rate_at_date(
             payment_date,
             input.base_annual_interest_rate_pct,
             &rate_overrides,
         );
-        if month > 1 && (payment_rate - current_segment_rate).abs() > 1e-12 {
-            segments.push(PaymentSegment {
-                start_month: current_segment_start_month,
-                end_month: month - 1,
-                annual_interest_rate_pct: current_segment_rate,
-                monthly_payment_base: current_monthly_payment_base,
-            });
+
+        let rate_changed =
+            has_active_segment && (payment_rate - current_segment_rate).abs() > 1e-12;
+        let should_recompute_monthly_payment = !has_active_segment
+            || recompute_monthly_payment_at_month_start
+            || had_extra_payment_before_scheduled_payment
+            || rate_changed;
+
+        if should_recompute_monthly_payment {
+            if has_active_segment {
+                segments.push(PaymentSegment {
+                    start_month: current_segment_start_month,
+                    end_month: month - 1,
+                    annual_interest_rate_pct: current_segment_rate,
+                    monthly_payment_base: current_monthly_payment_base,
+                });
+            }
 
             current_segment_start_month = month;
             current_segment_rate = payment_rate;
-            let remaining_term_months = total_months - month + 1;
-            current_monthly_payment_base = compute_monthly_payment(
-                remaining_principal,
-                current_segment_rate,
-                remaining_term_months,
-            );
+            if input.round_monthly_payment_up {
+                let remaining_term_months = total_months - month + 1;
+                current_monthly_payment_base = round_half_up(compute_monthly_payment(
+                    principal_before_scheduled_payment,
+                    current_segment_rate,
+                    remaining_term_months,
+                ));
+            } else {
+                current_monthly_payment_base = solve_monthly_payment_base_daily(
+                    principal_before_scheduled_payment,
+                    interest_payment,
+                    month,
+                    &payment_dates,
+                    current_segment_rate,
+                );
+            }
+            has_active_segment = true;
         }
 
-        let interest_payment = accrue_interest_for_period_daily(
-            remaining_principal,
-            regular_period_start,
-            payment_date,
-            input.base_annual_interest_rate_pct,
-            &rate_overrides,
-        );
-        let arrears_interest_signed = if month == 1 {
-            accrue_interest_for_period_daily_signed(
-                remaining_principal,
-                input.start_date,
-                start_month_anchor,
-                input.base_annual_interest_rate_pct,
-                &rate_overrides,
-            )
-        } else {
-            0.0
-        };
         let total_interest_payment = interest_payment + arrears_interest_signed;
-        let mut principal_payment = current_monthly_payment_base - interest_payment;
+        let (
+            interest_payment_for_schedule,
+            principal_payment_for_schedule,
+            principal_payment_for_ledger,
+        ) = if input.round_monthly_payment_up {
+            let regular_interest_posted = round_down_towards_zero(interest_payment);
+            let total_interest_posted = round_down_towards_zero(total_interest_payment);
+            let mut principal_posted = current_monthly_payment_base - regular_interest_posted;
+            if principal_posted < 0.0 {
+                principal_posted = 0.0;
+            }
+            if principal_posted > principal_before_scheduled_payment {
+                principal_posted = principal_before_scheduled_payment;
+            }
+            (total_interest_posted, principal_posted, principal_posted)
+        } else {
+            let mut principal_payment = current_monthly_payment_base - interest_payment;
+            if principal_payment < 0.0 {
+                principal_payment = 0.0;
+            }
+            if principal_payment > principal_before_scheduled_payment {
+                principal_payment = principal_before_scheduled_payment;
+            }
+            (total_interest_payment, principal_payment, principal_payment)
+        };
 
-        if month == total_months || principal_payment > remaining_principal {
-            principal_payment = remaining_principal;
-        }
-
-        remaining_principal -= principal_payment;
+        remaining_principal = principal_before_scheduled_payment - principal_payment_for_ledger;
         if remaining_principal.abs() < 1e-8 {
             remaining_principal = 0.0;
         }
 
+        let had_same_day_extra_payment = apply_extra_payment_on_date(
+            &mut remaining_principal,
+            payment_date,
+            &extra_payments,
+            &mut applied_extra_payments,
+        );
+        recompute_monthly_payment_at_month_start = had_same_day_extra_payment;
+
         let fees_payment = input.monthly_fees;
-        let (interest_payment_for_schedule, principal_payment_for_schedule) =
-            if input.round_monthly_payment_up {
-                (
-                    round_half_up(total_interest_payment),
-                    round_half_up(principal_payment),
-                )
-            } else {
-                (total_interest_payment, principal_payment)
-            };
         let total_payment =
             interest_payment_for_schedule + principal_payment_for_schedule + fees_payment;
 
@@ -284,12 +401,14 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
         });
     }
 
-    segments.push(PaymentSegment {
-        start_month: current_segment_start_month,
-        end_month: total_months,
-        annual_interest_rate_pct: current_segment_rate,
-        monthly_payment_base: current_monthly_payment_base,
-    });
+    if has_active_segment {
+        segments.push(PaymentSegment {
+            start_month: current_segment_start_month,
+            end_month: total_months,
+            annual_interest_rate_pct: current_segment_rate,
+            monthly_payment_base: current_monthly_payment_base,
+        });
+    }
 
     let selected_segment = segments
         .iter()
@@ -318,6 +437,11 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
         .iter()
         .map(|entry| entry.total_payment)
         .sum();
+    let total_extra_payments: f64 = applied_extra_payments
+        .iter()
+        .map(|entry| entry.applied_amount)
+        .sum();
+    let total_repayment = total_repayment + total_extra_payments;
     let total_paid_all_in = total_repayment + input.one_time_fees;
     let loan_cost = total_paid_all_in - input.loan_amount;
     let purchase_price_estimate = input.loan_amount;
@@ -340,6 +464,8 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
         down_payment_ratio_pct,
         segments,
         repayment_schedule,
+        applied_extra_payments,
+        total_extra_payments,
     })
 }
 
@@ -385,6 +511,150 @@ fn normalize_rate_overrides(
     Ok(overrides)
 }
 
+fn normalize_extra_payments(
+    extra_payments: &[ExtraPayment],
+    start_date: DateYmd,
+    last_payment_date: DateYmd,
+) -> Result<BTreeMap<DateYmd, f64>, CalcError> {
+    let mut normalized = BTreeMap::new();
+
+    for extra_payment in extra_payments {
+        if extra_payment.effective_date < start_date
+            || extra_payment.effective_date > last_payment_date
+        {
+            return Err(CalcError::InvalidExtraPaymentDate {
+                date: extra_payment.effective_date,
+                min_date: start_date,
+                max_date: last_payment_date,
+            });
+        }
+
+        if !extra_payment.amount.is_finite() || extra_payment.amount < 0.0 {
+            return Err(CalcError::InvalidExtraPaymentAmount {
+                date: extra_payment.effective_date,
+            });
+        }
+
+        if extra_payment.amount == 0.0 {
+            continue;
+        }
+
+        let entry = normalized
+            .entry(extra_payment.effective_date)
+            .or_insert(0.0);
+        *entry += extra_payment.amount;
+    }
+
+    Ok(normalized)
+}
+
+fn apply_extra_payment_on_date(
+    principal: &mut f64,
+    date: DateYmd,
+    extra_payments: &BTreeMap<DateYmd, f64>,
+    applied_extra_payments: &mut Vec<AppliedExtraPaymentEntry>,
+) -> bool {
+    if *principal <= 0.0 {
+        return false;
+    }
+
+    let Some(extra_amount) = extra_payments.get(&date).copied() else {
+        return false;
+    };
+    if extra_amount <= 0.0 {
+        return false;
+    }
+
+    let applied_amount = principal.min(extra_amount);
+    if applied_amount <= 0.0 {
+        return false;
+    }
+
+    *principal -= applied_amount;
+    if principal.abs() < 1e-8 {
+        *principal = 0.0;
+    }
+
+    applied_extra_payments.push(AppliedExtraPaymentEntry {
+        effective_date: date,
+        applied_amount,
+    });
+    true
+}
+
+fn simulate_period_daily_with_events(
+    principal_start: f64,
+    period_start: DateYmd,
+    period_end: DateYmd,
+    base_annual_interest_rate_pct: f64,
+    rate_overrides: &BTreeMap<DateYmd, f64>,
+    extra_payments: &BTreeMap<DateYmd, f64>,
+    applied_extra_payments: &mut Vec<AppliedExtraPaymentEntry>,
+    day_count: DayCountConvention,
+) -> (f64, f64, bool) {
+    if period_end <= period_start {
+        return (0.0, principal_start, false);
+    }
+
+    let mut interest = 0.0;
+    let mut principal = principal_start;
+    let mut cursor = period_start;
+    let mut segment_rate = rate_at_date(cursor, base_annual_interest_rate_pct, rate_overrides);
+    let mut had_extra_payment = false;
+
+    loop {
+        let next_rate_change_date = rate_overrides
+            .range(cursor..period_end)
+            .find_map(|(date, _)| if *date > cursor { Some(*date) } else { None });
+        let next_extra_payment_date =
+            extra_payments
+                .range(cursor..period_end)
+                .find_map(|(date, amount)| {
+                    if *date > cursor && *amount > 0.0 {
+                        Some(*date)
+                    } else {
+                        None
+                    }
+                });
+
+        let next_event_date = match (next_rate_change_date, next_extra_payment_date) {
+            (Some(rate_date), Some(extra_date)) => Some(rate_date.min(extra_date)),
+            (Some(rate_date), None) => Some(rate_date),
+            (None, Some(extra_date)) => Some(extra_date),
+            (None, None) => None,
+        };
+
+        let segment_end = next_event_date.unwrap_or(period_end);
+        interest += accrue_interest_with_day_count(
+            principal,
+            cursor,
+            segment_end,
+            segment_rate,
+            day_count,
+        );
+
+        if segment_end >= period_end {
+            break;
+        }
+
+        if let Some(override_rate) = rate_overrides.get(&segment_end).copied() {
+            segment_rate = override_rate;
+        }
+        if apply_extra_payment_on_date(
+            &mut principal,
+            segment_end,
+            extra_payments,
+            applied_extra_payments,
+        ) {
+            had_extra_payment = true;
+        }
+
+        cursor = segment_end;
+    }
+
+    (interest, principal, had_extra_payment)
+}
+
 fn rate_at_date(
     date: DateYmd,
     base_annual_interest_rate_pct: f64,
@@ -403,6 +673,7 @@ fn accrue_interest_for_period_daily(
     period_end: DateYmd,
     base_annual_interest_rate_pct: f64,
     rate_overrides: &BTreeMap<DateYmd, f64>,
+    day_count: DayCountConvention,
 ) -> f64 {
     if period_end <= period_start {
         return 0.0;
@@ -418,43 +689,58 @@ fn accrue_interest_for_period_daily(
             continue;
         }
 
-        let segment_days =
-            (change_date.days_since_epoch() - segment_start.days_since_epoch()).max(0) as f64;
-        interest += principal * (segment_rate / 100.0) * (segment_days / 365.0);
+        interest +=
+            accrue_interest_with_day_count(principal, segment_start, *change_date, segment_rate, day_count);
 
         segment_start = *change_date;
         segment_rate = *override_rate;
     }
 
-    let remaining_days =
-        (period_end.days_since_epoch() - segment_start.days_since_epoch()).max(0) as f64;
-    interest += principal * (segment_rate / 100.0) * (remaining_days / 365.0);
+    interest += accrue_interest_with_day_count(
+        principal,
+        segment_start,
+        period_end,
+        segment_rate,
+        day_count,
+    );
     interest
 }
 
-fn accrue_interest_for_period_daily_signed(
+fn accrue_interest_with_day_count(
     principal: f64,
     from: DateYmd,
     to: DateYmd,
-    base_annual_interest_rate_pct: f64,
-    rate_overrides: &BTreeMap<DateYmd, f64>,
+    annual_rate_pct: f64,
+    day_count: DayCountConvention,
 ) -> f64 {
-    if to >= from {
-        accrue_interest_for_period_daily(
-            principal,
-            from,
-            to,
-            base_annual_interest_rate_pct,
-            rate_overrides,
-        )
-    } else {
-        -accrue_interest_for_period_daily(
-            principal,
-            to,
-            from,
-            base_annual_interest_rate_pct,
-            rate_overrides,
-        )
+    if to <= from || principal <= 0.0 || annual_rate_pct == 0.0 {
+        return 0.0;
+    }
+
+    match day_count {
+        DayCountConvention::Actual365Fixed => {
+            let days = (to.days_since_epoch() - from.days_since_epoch()).max(0) as f64;
+            principal * (annual_rate_pct / 100.0) * (days / 365.0)
+        }
+        DayCountConvention::ActualActual => {
+            let mut interest = 0.0;
+            let mut cursor = from;
+            while cursor < to {
+                let next_year_start =
+                    DateYmd::from_ymd_opt(cursor.year + 1, 1, 1).expect("valid next-year date");
+                let segment_end = if next_year_start < to {
+                    next_year_start
+                } else {
+                    to
+                };
+                let segment_days =
+                    (segment_end.days_since_epoch() - cursor.days_since_epoch()).max(0) as f64;
+                let denominator = if is_leap_year(cursor.year) { 366.0 } else { 365.0 };
+                interest += principal * (annual_rate_pct / 100.0) * (segment_days / denominator);
+                cursor = segment_end;
+            }
+            interest
+        }
     }
 }
 
@@ -492,6 +778,10 @@ fn last_day_of_month(year: i32, month: u32) -> u32 {
     this_month_last_day.2
 }
 
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
 fn compute_monthly_payment(principal: f64, annual_rate_pct: f64, remaining_months: u32) -> f64 {
     let monthly_rate = annual_rate_pct / 100.0 / 12.0;
 
@@ -504,8 +794,123 @@ fn compute_monthly_payment(principal: f64, annual_rate_pct: f64, remaining_month
     principal * monthly_rate * growth / (growth - 1.0)
 }
 
+fn solve_monthly_payment_base_daily(
+    principal_before_current_payment: f64,
+    current_period_interest: f64,
+    current_month: u32,
+    payment_dates: &[DateYmd],
+    annual_interest_rate_pct: f64,
+) -> f64 {
+    if principal_before_current_payment <= 0.0 {
+        return 0.0;
+    }
+
+    let residual_at_zero = remaining_principal_after_constant_payment_base(
+        principal_before_current_payment,
+        current_period_interest,
+        0.0,
+        current_month,
+        payment_dates,
+        annual_interest_rate_pct,
+    );
+    if residual_at_zero <= 1e-8 {
+        return 0.0;
+    }
+
+    let mut low = 0.0;
+    let mut high = (principal_before_current_payment + current_period_interest).max(1.0);
+    let mut high_residual = remaining_principal_after_constant_payment_base(
+        principal_before_current_payment,
+        current_period_interest,
+        high,
+        current_month,
+        payment_dates,
+        annual_interest_rate_pct,
+    );
+
+    let mut expansion_steps = 0;
+    while high_residual > 1e-8 && expansion_steps < 96 {
+        high *= 2.0;
+        high_residual = remaining_principal_after_constant_payment_base(
+            principal_before_current_payment,
+            current_period_interest,
+            high,
+            current_month,
+            payment_dates,
+            annual_interest_rate_pct,
+        );
+        expansion_steps += 1;
+    }
+
+    if high_residual > 1e-8 {
+        return high;
+    }
+
+    for _ in 0..96 {
+        let mid = (low + high) * 0.5;
+        let residual = remaining_principal_after_constant_payment_base(
+            principal_before_current_payment,
+            current_period_interest,
+            mid,
+            current_month,
+            payment_dates,
+            annual_interest_rate_pct,
+        );
+        if residual > 1e-8 {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+
+    high
+}
+
+fn remaining_principal_after_constant_payment_base(
+    principal_before_current_payment: f64,
+    current_period_interest: f64,
+    monthly_payment_base: f64,
+    current_month: u32,
+    payment_dates: &[DateYmd],
+    annual_interest_rate_pct: f64,
+) -> f64 {
+    let total_months = payment_dates.len() as u32;
+    let mut principal = principal_before_current_payment.max(0.0);
+
+    for month in current_month..=total_months {
+        let interest_payment = if month == current_month {
+            current_period_interest
+        } else {
+            let period_start = payment_dates[(month - 2) as usize];
+            let period_end = payment_dates[(month - 1) as usize];
+            let days =
+                (period_end.days_since_epoch() - period_start.days_since_epoch()).max(0) as f64;
+            principal * (annual_interest_rate_pct / 100.0) * (days / 365.0)
+        };
+
+        let mut principal_payment = monthly_payment_base - interest_payment;
+        if principal_payment < 0.0 {
+            principal_payment = 0.0;
+        }
+        if principal_payment > principal {
+            principal_payment = principal;
+        }
+
+        principal -= principal_payment;
+        if principal.abs() < 1e-8 {
+            principal = 0.0;
+        }
+    }
+
+    principal
+}
+
 fn round_half_up(value: f64) -> f64 {
     value.round()
+}
+
+fn round_down_towards_zero(value: f64) -> f64 {
+    value.trunc()
 }
 
 fn validate_non_negative(field: &'static str, value: f64) -> Result<(), CalcError> {
