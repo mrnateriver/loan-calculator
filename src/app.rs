@@ -128,6 +128,33 @@ impl RowActionOption {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetConfirmOption {
+    Cancel,
+    ConfirmReset,
+}
+
+impl ResetConfirmOption {
+    pub const ALL: [ResetConfirmOption; 2] =
+        [ResetConfirmOption::Cancel, ResetConfirmOption::ConfirmReset];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ResetConfirmOption::Cancel => "Cancel",
+            ResetConfirmOption::ConfirmReset => "Reset all data",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            ResetConfirmOption::Cancel => "Close dialog and keep current inputs and schedule.",
+            ResetConfirmOption::ConfirmReset => {
+                "Reset all inputs, APR overrides, extra payments, and selections."
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScheduleDisplayRow {
     Payment {
@@ -185,6 +212,8 @@ pub struct App {
     pub extra_edit_date_input_buffer: String,
     pub extra_edit_amount_input_buffer: String,
     pub extra_edit_active_row: usize,
+    pub is_reset_confirm_popup_open: bool,
+    pub reset_confirm_selected_index: usize,
     pub is_interest_basis_popup_open: bool,
     pub interest_basis_popup_selected_index: usize,
     pub selected_month: u32,
@@ -214,6 +243,8 @@ impl Default for App {
             extra_edit_date_input_buffer: String::new(),
             extra_edit_amount_input_buffer: String::new(),
             extra_edit_active_row: 0,
+            is_reset_confirm_popup_open: false,
+            reset_confirm_selected_index: 0,
             is_interest_basis_popup_open: false,
             interest_basis_popup_selected_index: 0,
             selected_month: 1,
@@ -236,7 +267,9 @@ impl Default for App {
 
 impl App {
     pub fn is_any_popup_open(&self) -> bool {
-        self.row_edit_popup_mode != RowEditPopupMode::None || self.is_interest_basis_popup_open
+        self.row_edit_popup_mode != RowEditPopupMode::None
+            || self.is_interest_basis_popup_open
+            || self.is_reset_confirm_popup_open
     }
 
     pub fn active_field(&self) -> FieldId {
@@ -405,6 +438,7 @@ impl App {
 
     pub fn open_row_action_popup_for_selected_row(&mut self) {
         self.is_interest_basis_popup_open = false;
+        self.is_reset_confirm_popup_open = false;
         self.row_action_selected_index = 0;
         self.row_edit_popup_mode = RowEditPopupMode::ActionSelect;
     }
@@ -441,6 +475,7 @@ impl App {
 
     pub fn open_apr_edit_popup_for_selected_row(&mut self) {
         self.is_interest_basis_popup_open = false;
+        self.is_reset_confirm_popup_open = false;
         self.sync_apr_edit_popup_inputs();
         self.apr_edit_active_row = 0;
         self.row_edit_popup_mode = RowEditPopupMode::AprEdit;
@@ -512,6 +547,7 @@ impl App {
 
     pub fn open_extra_edit_popup_for_selected_row(&mut self) {
         self.is_interest_basis_popup_open = false;
+        self.is_reset_confirm_popup_open = false;
         self.sync_extra_edit_popup_inputs();
         self.extra_edit_active_row = 0;
         self.row_edit_popup_mode = RowEditPopupMode::ExtraEdit;
@@ -583,6 +619,7 @@ impl App {
 
     pub fn open_interest_basis_popup(&mut self) {
         self.row_edit_popup_mode = RowEditPopupMode::None;
+        self.is_reset_confirm_popup_open = false;
         self.is_interest_basis_popup_open = true;
         self.interest_basis_popup_selected_index = InterestBasisMode::ALL
             .iter()
@@ -592,6 +629,45 @@ impl App {
 
     pub fn close_interest_basis_popup(&mut self) {
         self.is_interest_basis_popup_open = false;
+    }
+
+    pub fn open_reset_confirm_popup(&mut self) {
+        self.row_edit_popup_mode = RowEditPopupMode::None;
+        self.is_interest_basis_popup_open = false;
+        self.is_reset_confirm_popup_open = true;
+        self.reset_confirm_selected_index = 0;
+    }
+
+    pub fn close_reset_confirm_popup(&mut self) {
+        self.is_reset_confirm_popup_open = false;
+    }
+
+    pub fn reset_confirm_move_up(&mut self) {
+        if self.reset_confirm_selected_index == 0 {
+            return;
+        }
+        self.reset_confirm_selected_index -= 1;
+    }
+
+    pub fn reset_confirm_move_down(&mut self) {
+        if self.reset_confirm_selected_index + 1 >= ResetConfirmOption::ALL.len() {
+            return;
+        }
+        self.reset_confirm_selected_index += 1;
+    }
+
+    pub fn reset_confirm_selected_option(&self) -> ResetConfirmOption {
+        ResetConfirmOption::ALL
+            .get(self.reset_confirm_selected_index)
+            .copied()
+            .unwrap_or(ResetConfirmOption::Cancel)
+    }
+
+    pub fn apply_reset_confirm_selection(&mut self) {
+        match self.reset_confirm_selected_option() {
+            ResetConfirmOption::Cancel => self.close_reset_confirm_popup(),
+            ResetConfirmOption::ConfirmReset => self.reset(),
+        }
     }
 
     pub fn interest_basis_popup_move_up(&mut self) {
@@ -690,6 +766,8 @@ impl App {
         self.active_field_idx = 0;
         self.error = None;
         self.row_edit_popup_mode = RowEditPopupMode::None;
+        self.is_reset_confirm_popup_open = false;
+        self.reset_confirm_selected_index = 0;
         self.is_interest_basis_popup_open = false;
         self.row_action_selected_index = 0;
         self.apr_edit_date_input_buffer.clear();
@@ -1668,7 +1746,7 @@ fn last_day_of_month(year: i32, month: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, RowActionOption, ScheduleDisplayRow};
+    use super::{App, ResetConfirmOption, RowActionOption, ScheduleDisplayRow};
     use crate::model::{DateYmd, InterestBasisMode};
 
     #[test]
@@ -1955,6 +2033,40 @@ mod tests {
 
         app.toggle_round_payments_up();
         assert!(!app.round_payments_up);
+    }
+
+    #[test]
+    fn reset_confirmation_popup_cancel_and_confirm() {
+        let mut app = App::default();
+        app.inputs[0] = "123456".to_string();
+        app.round_payments_up = true;
+        app.rate_overrides
+            .insert(DateYmd::from_ymd_opt(2026, 10, 1).expect("valid date"), 7.5);
+
+        app.open_reset_confirm_popup();
+        assert!(app.is_reset_confirm_popup_open);
+        assert_eq!(
+            app.reset_confirm_selected_option(),
+            ResetConfirmOption::Cancel
+        );
+
+        app.apply_reset_confirm_selection();
+        assert!(!app.is_reset_confirm_popup_open);
+        assert_eq!(app.inputs[0], "123456");
+        assert!(app.round_payments_up);
+        assert_eq!(app.rate_overrides.len(), 1);
+
+        app.open_reset_confirm_popup();
+        app.reset_confirm_move_down();
+        assert_eq!(
+            app.reset_confirm_selected_option(),
+            ResetConfirmOption::ConfirmReset
+        );
+        app.apply_reset_confirm_selection();
+        assert!(!app.is_reset_confirm_popup_open);
+        assert_eq!(app.inputs[0], "300000");
+        assert!(!app.round_payments_up);
+        assert!(app.rate_overrides.is_empty());
     }
 
     #[test]

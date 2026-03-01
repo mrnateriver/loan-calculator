@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
-use crate::app::{App, FieldId, RowActionOption, ScheduleDisplayRow};
+use crate::app::{App, FieldId, ResetConfirmOption, RowActionOption, ScheduleDisplayRow};
 use crate::model::{DateYmd, LoanMetrics};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -32,7 +32,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_schedule(frame, app, schedule_area);
     render_help(frame, app, help_area);
 
-    if app.is_row_action_popup_open() {
+    if app.is_reset_confirm_popup_open {
+        render_reset_confirm_popup(frame, app);
+    } else if app.is_row_action_popup_open() {
         render_row_action_popup(frame, app);
     } else if app.is_apr_edit_popup_open() {
         render_apr_edit_popup(frame, app);
@@ -236,7 +238,9 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
-    let main_help = if app.is_row_action_popup_open() {
+    let main_help = if app.is_reset_confirm_popup_open {
+        "Reset confirm: up/down/j/k select | enter confirm | esc cancel"
+    } else if app.is_row_action_popup_open() {
         "Row action: up/down/j/k select | enter choose | esc cancel"
     } else if app.is_apr_edit_popup_open() {
         "APR dialog: up/down/j/k navigate | type | backspace | enter activate row | esc cancel"
@@ -265,6 +269,59 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     frame.render_widget(help, area);
+}
+
+fn render_reset_confirm_popup(frame: &mut Frame, app: &App) {
+    let options = ResetConfirmOption::ALL;
+    let list_height = options.len() as u16 + 2;
+    let footer_height = 4;
+    let popup_area = centered_rect_exact(48, list_height + footer_height, frame.area());
+    frame.render_widget(Clear, popup_area);
+
+    let [list_area, footer_area] = Layout::vertical([
+        Constraint::Length(list_height),
+        Constraint::Length(footer_height),
+    ])
+    .areas(popup_area);
+
+    let row_width = list_area.width.saturating_sub(2) as usize;
+    let mut rows = Vec::with_capacity(options.len());
+    for (idx, option) in options.iter().enumerate() {
+        let text = format!("{:<width$}", option.label(), width = row_width);
+        let style = if idx == app.reset_confirm_selected_index {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        rows.push(Line::styled(text, style));
+    }
+
+    let list = Paragraph::new(Text::from(rows))
+        .block(
+            Block::default()
+                .title(" Confirm Reset ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(list, list_area);
+
+    let selected = app.reset_confirm_selected_option();
+    let footer = Paragraph::new(Text::from(vec![
+        Line::from("Reset all inputs and schedule adjustments?"),
+        Line::from(selected.description()),
+    ]))
+    .block(
+        Block::default()
+            .title(" Selected Option ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    )
+    .wrap(Wrap { trim: true });
+    frame.render_widget(footer, footer_area);
 }
 
 fn render_row_action_popup(frame: &mut Frame, app: &App) {

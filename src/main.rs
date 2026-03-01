@@ -63,7 +63,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App) 
             return Ok(());
         }
 
-        if app.is_row_action_popup_open() {
+        if app.is_reset_confirm_popup_open {
+            handle_reset_confirm_popup_key(&mut app, key_event);
+        } else if app.is_row_action_popup_open() {
             handle_row_action_popup_key(&mut app, key_event);
         } else if app.is_apr_edit_popup_open() {
             handle_apr_edit_popup_key(&mut app, key_event);
@@ -79,8 +81,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App) 
 
 fn handle_main_key(app: &mut App, key_event: KeyEvent) {
     match key_event.code {
-        KeyCode::Char('r') if key_event.modifiers.is_empty() => app.reset(),
-        KeyCode::Char('R') if key_event.modifiers == KeyModifiers::SHIFT => app.reset(),
+        KeyCode::Char('r') if key_event.modifiers.is_empty() => app.open_reset_confirm_popup(),
+        KeyCode::Char('R') if key_event.modifiers == KeyModifiers::SHIFT => {
+            app.open_reset_confirm_popup()
+        }
         KeyCode::Left => app.focus_inputs(),
         KeyCode::Right => app.focus_schedule(),
         KeyCode::Up => app.navigate_up(),
@@ -123,6 +127,18 @@ fn handle_main_key(app: &mut App, key_event: KeyEvent) {
         {
             app.input_char(c);
         }
+        _ => {}
+    }
+}
+
+fn handle_reset_confirm_popup_key(app: &mut App, key_event: KeyEvent) {
+    match key_event.code {
+        KeyCode::Esc => app.close_reset_confirm_popup(),
+        KeyCode::Enter => app.apply_reset_confirm_selection(),
+        KeyCode::Up => app.reset_confirm_move_up(),
+        KeyCode::Down => app.reset_confirm_move_down(),
+        KeyCode::Char('k') if key_event.modifiers.is_empty() => app.reset_confirm_move_up(),
+        KeyCode::Char('j') if key_event.modifiers.is_empty() => app.reset_confirm_move_down(),
         _ => {}
     }
 }
