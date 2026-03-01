@@ -150,6 +150,8 @@ pub struct App {
     pub row_rate_apr_input_buffer: String,
     pub row_rate_extra_input_buffer: String,
     pub row_rate_popup_active_field: RowRatePopupField,
+    pub is_interest_basis_popup_open: bool,
+    pub interest_basis_popup_selected_index: usize,
     pub selected_month: u32,
     pub round_payments_up: bool,
     pub interest_basis_mode: InterestBasisMode,
@@ -174,6 +176,8 @@ impl Default for App {
             row_rate_apr_input_buffer: String::new(),
             row_rate_extra_input_buffer: String::new(),
             row_rate_popup_active_field: RowRatePopupField::EffectiveDate,
+            is_interest_basis_popup_open: false,
+            interest_basis_popup_selected_index: 0,
             selected_month: 1,
             round_payments_up: false,
             interest_basis_mode: InterestBasisMode::Act365Fixed,
@@ -193,6 +197,10 @@ impl Default for App {
 }
 
 impl App {
+    pub fn is_any_popup_open(&self) -> bool {
+        self.is_row_rate_popup_open || self.is_interest_basis_popup_open
+    }
+
     pub fn active_field(&self) -> FieldId {
         FieldId::ALL[self.active_field_idx]
     }
@@ -331,11 +339,62 @@ impl App {
         self.sync_selected_month_from_selection();
         self.sync_row_rate_popup_inputs();
         self.row_rate_popup_active_field = RowRatePopupField::EffectiveDate;
+        self.is_interest_basis_popup_open = false;
         self.is_row_rate_popup_open = true;
     }
 
     pub fn close_row_rate_popup(&mut self) {
         self.is_row_rate_popup_open = false;
+    }
+
+    pub fn open_interest_basis_popup(&mut self) {
+        self.is_row_rate_popup_open = false;
+        self.is_interest_basis_popup_open = true;
+        self.interest_basis_popup_selected_index = InterestBasisMode::ALL
+            .iter()
+            .position(|mode| *mode == self.interest_basis_mode)
+            .unwrap_or(0);
+    }
+
+    pub fn close_interest_basis_popup(&mut self) {
+        self.is_interest_basis_popup_open = false;
+    }
+
+    pub fn interest_basis_popup_move_up(&mut self) {
+        if self.interest_basis_popup_selected_index == 0 {
+            return;
+        }
+
+        self.interest_basis_popup_selected_index -= 1;
+    }
+
+    pub fn interest_basis_popup_move_down(&mut self) {
+        if self.interest_basis_popup_selected_index + 1 >= InterestBasisMode::ALL.len() {
+            return;
+        }
+
+        self.interest_basis_popup_selected_index += 1;
+    }
+
+    pub fn apply_interest_basis_popup_selection(&mut self) {
+        let Some(mode) = InterestBasisMode::ALL
+            .get(self.interest_basis_popup_selected_index)
+            .copied()
+        else {
+            return;
+        };
+
+        self.interest_basis_mode = mode;
+        self.persist_state_silently();
+        self.recalculate();
+        self.close_interest_basis_popup();
+    }
+
+    pub fn interest_basis_popup_selected_mode(&self) -> InterestBasisMode {
+        InterestBasisMode::ALL
+            .get(self.interest_basis_popup_selected_index)
+            .copied()
+            .unwrap_or(self.interest_basis_mode)
     }
 
     pub fn row_rate_popup_next_field(&mut self) {
@@ -421,21 +480,17 @@ impl App {
         self.recalculate();
     }
 
-    pub fn cycle_interest_basis_mode(&mut self) {
-        self.interest_basis_mode = self.interest_basis_mode.next();
-        self.persist_state_silently();
-        self.recalculate();
-    }
-
     pub fn reset(&mut self) {
         self.inputs = default_inputs();
         self.active_field_idx = 0;
         self.error = None;
         self.is_row_rate_popup_open = false;
+        self.is_interest_basis_popup_open = false;
         self.row_rate_date_input_buffer.clear();
         self.row_rate_apr_input_buffer.clear();
         self.row_rate_extra_input_buffer.clear();
         self.row_rate_popup_active_field = RowRatePopupField::EffectiveDate;
+        self.interest_basis_popup_selected_index = 0;
         self.selected_month = 1;
         self.round_payments_up = false;
         self.interest_basis_mode = InterestBasisMode::Act365Fixed;
@@ -1637,20 +1692,28 @@ mod tests {
     }
 
     #[test]
-    fn cycling_interest_basis_advances_modes() {
+    fn interest_basis_popup_selection_applies_mode() {
         let mut app = App::default();
         assert_eq!(app.interest_basis_mode, InterestBasisMode::Act365Fixed);
+        assert!(!app.is_interest_basis_popup_open);
 
-        app.cycle_interest_basis_mode();
-        assert_eq!(app.interest_basis_mode, InterestBasisMode::ActActual);
+        app.open_interest_basis_popup();
+        assert!(app.is_interest_basis_popup_open);
+        assert_eq!(
+            app.interest_basis_popup_selected_mode(),
+            InterestBasisMode::Act365Fixed
+        );
 
-        app.cycle_interest_basis_mode();
-        assert_eq!(app.interest_basis_mode, InterestBasisMode::ThirtyE360);
+        app.interest_basis_popup_move_down();
+        app.interest_basis_popup_move_down();
+        assert_eq!(
+            app.interest_basis_popup_selected_mode(),
+            InterestBasisMode::ThirtyE360
+        );
 
-        app.cycle_interest_basis_mode();
-        assert_eq!(app.interest_basis_mode, InterestBasisMode::Apr12Monthly);
-
-        app.cycle_interest_basis_mode();
         assert_eq!(app.interest_basis_mode, InterestBasisMode::Act365Fixed);
+        app.apply_interest_basis_popup_selection();
+        assert_eq!(app.interest_basis_mode, InterestBasisMode::ThirtyE360);
+        assert!(!app.is_interest_basis_popup_open);
     }
 }

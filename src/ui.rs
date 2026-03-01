@@ -34,6 +34,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if app.is_row_rate_popup_open {
         render_row_rate_popup(frame, app);
+    } else if app.is_interest_basis_popup_open {
+        render_interest_basis_popup(frame, app);
     }
 }
 
@@ -41,7 +43,7 @@ fn render_form(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::with_capacity(FieldId::ALL.len());
 
     for field in FieldId::ALL {
-        let is_active = field == app.active_field() && !app.is_row_rate_popup_open;
+        let is_active = field == app.active_field() && !app.is_any_popup_open();
         let marker = if is_active { ">" } else { " " };
         let value = app.field_display_value(field);
 
@@ -220,8 +222,10 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     let main_help = if app.is_row_rate_popup_open {
         "Row editor: tab/up/down switch field | type | backspace | enter apply | d clear APR | esc cancel"
+    } else if app.is_interest_basis_popup_open {
+        "Interest basis: up/down/j/k select | enter apply | esc cancel"
     } else {
-        "up/down/j/k: navigate | tab/shift+tab: switch panels | enter on schedule: edit row | space/enter: toggle | r: reset | q: quit"
+        "up/down/j/k: navigate | tab/shift+tab: switch panels | enter on schedule: edit row | space/enter: toggle/select | r: reset | q: quit"
     };
 
     let mut lines = vec![Line::from(main_help)];
@@ -345,6 +349,58 @@ fn render_row_rate_popup(frame: &mut Frame, app: &App) {
     frame.render_widget(popup, popup_area);
 }
 
+fn render_interest_basis_popup(frame: &mut Frame, app: &App) {
+    let total_options = crate::model::InterestBasisMode::ALL.len() as u16;
+    let list_height = total_options + 2;
+    let footer_height = 4;
+    let popup_height = list_height + footer_height;
+    let popup_area = centered_rect_exact(56, popup_height, frame.area());
+    frame.render_widget(Clear, popup_area);
+
+    let [list_area, footer_area] = Layout::vertical([
+        Constraint::Length(list_height),
+        Constraint::Length(footer_height),
+    ])
+    .areas(popup_area);
+
+    let row_width = list_area.width.saturating_sub(2) as usize;
+    let mut rows = Vec::with_capacity(crate::model::InterestBasisMode::ALL.len());
+
+    for (idx, mode) in crate::model::InterestBasisMode::ALL.iter().enumerate() {
+        let text = format!("{:<width$}", mode.label(), width = row_width);
+        let style = if idx == app.interest_basis_popup_selected_index {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        rows.push(Line::styled(text, style));
+    }
+
+    let list = Paragraph::new(Text::from(rows))
+        .block(
+            Block::default()
+                .title(" Interest Basis ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(list, list_area);
+
+    let selected_mode = app.interest_basis_popup_selected_mode();
+    let footer = Paragraph::new(Text::from(vec![Line::from(selected_mode.description())]))
+        .block(
+            Block::default()
+                .title(" Selected Option ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: true });
+    frame.render_widget(footer, footer_area);
+}
+
 fn summary_lines(metrics: &LoanMetrics) -> Vec<Line<'static>> {
     let next_change = match (
         metrics.next_change_month,
@@ -411,4 +467,12 @@ fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
     .split(vertical[1]);
 
     horizontal[1]
+}
+
+fn centered_rect_exact(width: u16, height: u16, area: Rect) -> Rect {
+    let popup_width = width.min(area.width).max(1);
+    let popup_height = height.min(area.height).max(1);
+    let x = area.x + area.width.saturating_sub(popup_width) / 2;
+    let y = area.y + area.height.saturating_sub(popup_height) / 2;
+    Rect::new(x, y, popup_width, popup_height)
 }

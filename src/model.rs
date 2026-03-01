@@ -81,12 +81,28 @@ pub enum InterestBasisMode {
 }
 
 impl InterestBasisMode {
+    pub const ALL: [InterestBasisMode; 4] = [
+        InterestBasisMode::Act365Fixed,
+        InterestBasisMode::ActActual,
+        InterestBasisMode::ThirtyE360,
+        InterestBasisMode::Apr12Monthly,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             InterestBasisMode::Act365Fixed => "ACT/365",
             InterestBasisMode::ActActual => "ACT/ACT",
             InterestBasisMode::ThirtyE360 => "30E/360",
             InterestBasisMode::Apr12Monthly => "APR/12 monthly",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            InterestBasisMode::Act365Fixed => "Actual days with fixed 365-day denominator.",
+            InterestBasisMode::ActActual => "Actual days with 365/366 denominator by year.",
+            InterestBasisMode::ThirtyE360 => "30E/360 day count convention.",
+            InterestBasisMode::Apr12Monthly => "APR/12 monthly basis prorated by actual/30 days.",
         }
     }
 
@@ -106,15 +122,6 @@ impl InterestBasisMode {
             "30e_360" => Some(InterestBasisMode::ThirtyE360),
             "apr_12_monthly" => Some(InterestBasisMode::Apr12Monthly),
             _ => None,
-        }
-    }
-
-    pub fn next(self) -> Self {
-        match self {
-            InterestBasisMode::Act365Fixed => InterestBasisMode::ActActual,
-            InterestBasisMode::ActActual => InterestBasisMode::ThirtyE360,
-            InterestBasisMode::ThirtyE360 => InterestBasisMode::Apr12Monthly,
-            InterestBasisMode::Apr12Monthly => InterestBasisMode::Act365Fixed,
         }
     }
 }

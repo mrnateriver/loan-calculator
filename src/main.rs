@@ -65,6 +65,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App) 
 
         if app.is_row_rate_popup_open {
             handle_row_rate_popup_key(&mut app, key_event);
+        } else if app.is_interest_basis_popup_open {
+            handle_interest_basis_popup_key(&mut app, key_event);
         } else {
             handle_main_key(&mut app, key_event);
         }
@@ -95,7 +97,7 @@ fn handle_main_key(app: &mut App, key_event: KeyEvent) {
         KeyCode::Char(' ')
             if !app.is_schedule_focused() && app.active_field() == FieldId::InterestBasis =>
         {
-            app.cycle_interest_basis_mode()
+            app.open_interest_basis_popup()
         }
         KeyCode::Enter if app.is_schedule_focused() => app.open_row_rate_popup(),
         KeyCode::Enter
@@ -106,7 +108,7 @@ fn handle_main_key(app: &mut App, key_event: KeyEvent) {
         KeyCode::Enter
             if !app.is_schedule_focused() && app.active_field() == FieldId::InterestBasis =>
         {
-            app.cycle_interest_basis_mode()
+            app.open_interest_basis_popup()
         }
         KeyCode::Enter => app.recalculate(),
         KeyCode::Backspace if !app.is_schedule_focused() => app.backspace(),
@@ -138,6 +140,20 @@ fn handle_row_rate_popup_key(app: &mut App, key_event: KeyEvent) {
             if key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT =>
         {
             app.row_rate_input_char(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_interest_basis_popup_key(app: &mut App, key_event: KeyEvent) {
+    match key_event.code {
+        KeyCode::Esc => app.close_interest_basis_popup(),
+        KeyCode::Enter => app.apply_interest_basis_popup_selection(),
+        KeyCode::Up => app.interest_basis_popup_move_up(),
+        KeyCode::Down => app.interest_basis_popup_move_down(),
+        KeyCode::Char('k') if key_event.modifiers.is_empty() => app.interest_basis_popup_move_up(),
+        KeyCode::Char('j') if key_event.modifiers.is_empty() => {
+            app.interest_basis_popup_move_down()
         }
         _ => {}
     }
