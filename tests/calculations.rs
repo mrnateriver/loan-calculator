@@ -24,6 +24,30 @@ fn sample_input() -> LoanInput {
     }
 }
 
+fn round_half_up(value: f64) -> f64 {
+    if value >= 0.0 {
+        (value + 0.5).floor()
+    } else {
+        (value - 0.5).ceil()
+    }
+}
+
+fn annuity_payment_base_half_up(
+    principal: f64,
+    annual_interest_rate_pct: f64,
+    remaining_months: f64,
+) -> f64 {
+    let remaining_months = remaining_months.max(1.0);
+    let monthly_rate = annual_interest_rate_pct / 100.0 / 12.0;
+    if monthly_rate.abs() < f64::EPSILON {
+        return round_half_up(principal / remaining_months);
+    }
+
+    let growth = (1.0 + monthly_rate).powf(remaining_months);
+    let payment = principal * monthly_rate * growth / (growth - 1.0);
+    round_half_up(payment)
+}
+
 #[test]
 fn fixed_rate_metrics_still_match_baseline_values() {
     let input = sample_input();
@@ -609,6 +633,148 @@ fn rounded_mode_uses_truncated_interest_with_carry_forward() {
         principal -= entry.principal_payment;
         period_start = entry.payment_date;
     }
+}
+
+#[test]
+fn rounded_mode_mid_cycle_override_keeps_constant_segment_installment_until_payoff() {
+    let mut input = sample_input();
+    input.loan_amount = 3_980_000.0;
+    input.monthly_fees = 70.0;
+    input.base_annual_interest_rate_pct = 5.85;
+    input.start_date = DateYmd::from_ymd_opt(2027, 2, 11).expect("valid date");
+    input.payment_day = 16;
+    input.round_monthly_payment_up = true;
+    input.interest_basis_mode = InterestBasisMode::ActActual;
+    input.rate_overrides = vec![RateOverride {
+        effective_date: DateYmd::from_ymd_opt(2027, 5, 3).expect("valid date"),
+        annual_interest_rate_pct: 4.90,
+    }];
+
+    let metrics = calculate_metrics(&input, 6).expect("calculation should succeed");
+    let changed_segment = metrics
+        .segments
+        .iter()
+        .find(|segment| (segment.annual_interest_rate_pct - 4.90).abs() < 1e-9)
+        .expect("changed-rate segment should exist");
+    let expected_total_for_segment = changed_segment.monthly_payment_base + input.monthly_fees;
+    let changed_segment_start = changed_segment.start_month.saturating_sub(1) as usize;
+    let last_index = metrics.repayment_schedule.len().saturating_sub(1);
+
+    for row in metrics
+        .repayment_schedule
+        .iter()
+        .enumerate()
+        .skip(changed_segment_start)
+    {
+        let (index, entry) = row;
+        if index == last_index {
+            continue;
+        }
+
+        assert_relative_eq!(
+            entry.total_payment,
+            expected_total_for_segment,
+            epsilon = 1e-9
+        );
+    }
+}
+
+#[test]
+fn rounded_mode_future_override_does_not_affect_initial_segment() {
+    let mut baseline_input = sample_input();
+    baseline_input.loan_amount = 1_950_000.0;
+    baseline_input.monthly_fees = 80.0;
+    baseline_input.base_annual_interest_rate_pct = 5.6;
+    baseline_input.start_date = DateYmd::from_ymd_opt(2027, 3, 9).expect("valid date");
+    baseline_input.payment_day = 24;
+    baseline_input.interest_basis_mode = InterestBasisMode::ActActual;
+    baseline_input.round_monthly_payment_up = true;
+
+    let baseline = calculate_metrics(&baseline_input, 1).expect("baseline should succeed");
+
+    let mut with_override_input = baseline_input.clone();
+    with_override_input.rate_overrides = vec![RateOverride {
+        effective_date: DateYmd::from_ymd_opt(2029, 7, 6).expect("valid date"),
+        annual_interest_rate_pct: 3.95,
+    }];
+    let with_override =
+        calculate_metrics(&with_override_input, 1).expect("override schedule should succeed");
+
+    for month_index in 0..12 {
+        assert_relative_eq!(
+            with_override.repayment_schedule[month_index].total_payment,
+            baseline.repayment_schedule[month_index].total_payment,
+            epsilon = 1e-9
+        );
+        assert_relative_eq!(
+            with_override.repayment_schedule[month_index].interest_payment,
+            baseline.repayment_schedule[month_index].interest_payment,
+            epsilon = 1e-9
+        );
+        assert_relative_eq!(
+            with_override.repayment_schedule[month_index].principal_payment,
+            baseline.repayment_schedule[month_index].principal_payment,
+            epsilon = 1e-9
+        );
+    }
+}
+
+#[test]
+fn rounded_mode_mid_cycle_override_reprices_with_stub_day_term_adjustment() {
+    let mut baseline_input = sample_input();
+    baseline_input.loan_amount = 2_828_033.0;
+    baseline_input.monthly_fees = 95.0;
+    baseline_input.base_annual_interest_rate_pct = 4.3459;
+    baseline_input.term_years = 20;
+    baseline_input.start_date = DateYmd::from_ymd_opt(2027, 9, 9).expect("valid date");
+    baseline_input.payment_day = 28;
+    baseline_input.interest_basis_mode = InterestBasisMode::ActActual;
+    baseline_input.round_monthly_payment_up = true;
+
+    let baseline = calculate_metrics(&baseline_input, 1).expect("baseline should succeed");
+
+    let mut with_override_input = baseline_input.clone();
+    let override_date = DateYmd::from_ymd_opt(2027, 12, 19).expect("valid date");
+    let override_rate = 3.0013;
+    with_override_input.rate_overrides = vec![RateOverride {
+        effective_date: override_date,
+        annual_interest_rate_pct: override_rate,
+    }];
+    let with_override =
+        calculate_metrics(&with_override_input, 3).expect("override schedule should succeed");
+
+    // Future override must not alter posted schedule rows before its effective date.
+    for month_index in 0..2 {
+        assert_relative_eq!(
+            with_override.repayment_schedule[month_index].total_payment,
+            baseline.repayment_schedule[month_index].total_payment,
+            epsilon = 1e-9
+        );
+    }
+
+    let payment_month_index = 3_u32;
+    let payment_row = &with_override.repayment_schedule[(payment_month_index - 1) as usize];
+    let principal_before_change = with_override_input.loan_amount
+        - with_override.repayment_schedule[0].principal_payment
+        - with_override.repayment_schedule[1].principal_payment;
+    let remaining_months = (with_override_input.term_years * 12 - payment_month_index + 1) as f64;
+    let stub_days =
+        (payment_row.payment_date.days_since_epoch() - override_date.days_since_epoch()) as f64;
+
+    let expected_adjusted_base = annuity_payment_base_half_up(
+        principal_before_change,
+        override_rate,
+        remaining_months - stub_days / 365.0,
+    );
+    let unadjusted_base =
+        annuity_payment_base_half_up(principal_before_change, override_rate, remaining_months);
+    assert!(
+        (expected_adjusted_base - unadjusted_base).abs() >= 1.0,
+        "fixture should require stub-day adjustment to change rounded installment"
+    );
+
+    let posted_base = payment_row.total_payment - payment_row.fees_payment;
+    assert_relative_eq!(posted_base, expected_adjusted_base, epsilon = 1e-9);
 }
 
 #[test]

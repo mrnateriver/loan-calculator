@@ -419,6 +419,7 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
             input.base_annual_interest_rate_pct,
             &rate_overrides,
         );
+        let current_period_total_interest = interest_payment + arrears_interest_signed;
 
         let rate_changed =
             has_active_segment && (payment_rate - current_segment_rate).abs() > 1e-12;
@@ -441,10 +442,21 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
             current_segment_rate = payment_rate;
             if input.round_monthly_payment_up {
                 let remaining_term_months = total_months - month + 1;
+                let adjusted_remaining_term_months = if rate_changed {
+                    adjusted_remaining_months_for_integer_repricing(
+                        remaining_term_months,
+                        regular_period_start,
+                        payment_date,
+                        payment_rate,
+                        &rate_overrides,
+                    )
+                } else {
+                    remaining_term_months as f64
+                };
                 current_monthly_payment_base = round_half_up(compute_monthly_payment(
                     principal_before_scheduled_payment,
                     current_segment_rate,
-                    remaining_term_months,
+                    adjusted_remaining_term_months,
                 ));
             } else {
                 current_monthly_payment_base = solve_monthly_payment_base_daily(
@@ -459,7 +471,7 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
             has_active_segment = true;
         }
 
-        let total_interest_payment = interest_payment + arrears_interest_signed;
+        let total_interest_payment = current_period_total_interest;
         let (
             interest_payment_for_schedule,
             mut principal_payment_for_schedule,
@@ -1051,16 +1063,45 @@ fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
-fn compute_monthly_payment(principal: f64, annual_rate_pct: f64, remaining_months: u32) -> f64 {
+fn compute_monthly_payment(principal: f64, annual_rate_pct: f64, remaining_months: f64) -> f64 {
+    let months = remaining_months.max(1.0);
     let monthly_rate = annual_rate_pct / 100.0 / 12.0;
 
     if monthly_rate.abs() < f64::EPSILON {
-        return principal / remaining_months as f64;
+        return principal / months;
     }
 
-    let months = remaining_months as f64;
     let growth = (1.0 + monthly_rate).powf(months);
     principal * monthly_rate * growth / (growth - 1.0)
+}
+
+fn adjusted_remaining_months_for_integer_repricing(
+    remaining_term_months: u32,
+    regular_period_start: DateYmd,
+    payment_date: DateYmd,
+    payment_rate: f64,
+    rate_overrides: &BTreeMap<DateYmd, f64>,
+) -> f64 {
+    let mut adjusted_remaining_months = remaining_term_months as f64;
+    let mut mid_cycle_override_date = None;
+
+    for (override_date, override_rate) in rate_overrides.range(regular_period_start..=payment_date)
+    {
+        if *override_date <= regular_period_start {
+            continue;
+        }
+
+        if (*override_rate - payment_rate).abs() < 1e-12 {
+            mid_cycle_override_date = Some(*override_date);
+        }
+    }
+
+    if let Some(override_date) = mid_cycle_override_date {
+        let stub_days = (payment_date.days_since_epoch() - override_date.days_since_epoch()).max(0);
+        adjusted_remaining_months -= stub_days as f64 / 365.0;
+    }
+
+    adjusted_remaining_months.max(1.0)
 }
 
 fn solve_monthly_payment_base_daily(
@@ -1184,6 +1225,10 @@ fn remaining_principal_after_constant_payment_base(
     principal
 }
 
+fn round_down_towards_zero(value: f64) -> f64 {
+    value.trunc()
+}
+
 fn round_half_up(value: f64) -> f64 {
     if !value.is_finite() {
         return value;
@@ -1193,10 +1238,6 @@ fn round_half_up(value: f64) -> f64 {
     } else {
         (value - 0.5).ceil()
     }
-}
-
-fn round_down_towards_zero(value: f64) -> f64 {
-    value.trunc()
 }
 
 fn day_count_30e_360(from: DateYmd, to: DateYmd) -> i64 {
