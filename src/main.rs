@@ -63,8 +63,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App) 
             return Ok(());
         }
 
-        if app.is_row_rate_popup_open {
-            handle_row_rate_popup_key(&mut app, key_event);
+        if app.is_row_action_popup_open() {
+            handle_row_action_popup_key(&mut app, key_event);
+        } else if app.is_apr_edit_popup_open() {
+            handle_apr_edit_popup_key(&mut app, key_event);
+        } else if app.is_extra_edit_popup_open() {
+            handle_extra_edit_popup_key(&mut app, key_event);
         } else if app.is_interest_basis_popup_open {
             handle_interest_basis_popup_key(&mut app, key_event);
         } else {
@@ -99,7 +103,7 @@ fn handle_main_key(app: &mut App, key_event: KeyEvent) {
         {
             app.open_interest_basis_popup()
         }
-        KeyCode::Enter if app.is_schedule_focused() => app.open_row_rate_popup(),
+        KeyCode::Enter if app.is_schedule_focused() => app.open_row_edit_popup(),
         KeyCode::Enter
             if !app.is_schedule_focused() && app.active_field() == FieldId::RoundPaymentsUp =>
         {
@@ -123,23 +127,49 @@ fn handle_main_key(app: &mut App, key_event: KeyEvent) {
     }
 }
 
-fn handle_row_rate_popup_key(app: &mut App, key_event: KeyEvent) {
+fn handle_row_action_popup_key(app: &mut App, key_event: KeyEvent) {
     match key_event.code {
-        KeyCode::Esc => app.close_row_rate_popup(),
-        KeyCode::Enter => app.apply_row_rate_override_at_selected_month(),
-        KeyCode::Tab | KeyCode::Down => app.row_rate_popup_next_field(),
-        KeyCode::BackTab | KeyCode::Up => app.row_rate_popup_previous_field(),
-        KeyCode::Backspace => app.row_rate_input_backspace(),
-        KeyCode::Char('d') if key_event.modifiers.is_empty() => {
-            app.clear_row_rate_override_at_selected_month()
-        }
-        KeyCode::Char('D') if key_event.modifiers == KeyModifiers::SHIFT => {
-            app.clear_row_rate_override_at_selected_month()
-        }
+        KeyCode::Esc => app.close_row_edit_popup(),
+        KeyCode::Enter => app.apply_row_action_popup_selection(),
+        KeyCode::Up => app.row_action_move_up(),
+        KeyCode::Down => app.row_action_move_down(),
+        KeyCode::Char('k') if key_event.modifiers.is_empty() => app.row_action_move_up(),
+        KeyCode::Char('j') if key_event.modifiers.is_empty() => app.row_action_move_down(),
+        _ => {}
+    }
+}
+
+fn handle_apr_edit_popup_key(app: &mut App, key_event: KeyEvent) {
+    match key_event.code {
+        KeyCode::Esc => app.close_row_edit_popup(),
+        KeyCode::Enter => app.activate_apr_edit_row_on_enter(),
+        KeyCode::Up => app.apr_edit_move_up(),
+        KeyCode::Down => app.apr_edit_move_down(),
+        KeyCode::Char('k') if key_event.modifiers.is_empty() => app.apr_edit_move_up(),
+        KeyCode::Char('j') if key_event.modifiers.is_empty() => app.apr_edit_move_down(),
+        KeyCode::Backspace => app.apr_edit_input_backspace(),
         KeyCode::Char(c)
             if key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT =>
         {
-            app.row_rate_input_char(c);
+            app.apr_edit_input_char(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_extra_edit_popup_key(app: &mut App, key_event: KeyEvent) {
+    match key_event.code {
+        KeyCode::Esc => app.close_row_edit_popup(),
+        KeyCode::Enter => app.activate_extra_edit_row_on_enter(),
+        KeyCode::Up => app.extra_edit_move_up(),
+        KeyCode::Down => app.extra_edit_move_down(),
+        KeyCode::Char('k') if key_event.modifiers.is_empty() => app.extra_edit_move_up(),
+        KeyCode::Char('j') if key_event.modifiers.is_empty() => app.extra_edit_move_down(),
+        KeyCode::Backspace => app.extra_edit_input_backspace(),
+        KeyCode::Char(c)
+            if key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT =>
+        {
+            app.extra_edit_input_char(c);
         }
         _ => {}
     }

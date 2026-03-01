@@ -1,13 +1,13 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Flex, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
-use crate::app::{App, FieldId, RowRatePopupField, ScheduleDisplayRow};
-use crate::model::LoanMetrics;
+use crate::app::{App, FieldId, RowActionOption, ScheduleDisplayRow};
+use crate::model::{DateYmd, LoanMetrics};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let [content_area, help_area] =
@@ -32,8 +32,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_schedule(frame, app, schedule_area);
     render_help(frame, app, help_area);
 
-    if app.is_row_rate_popup_open {
-        render_row_rate_popup(frame, app);
+    if app.is_row_action_popup_open() {
+        render_row_action_popup(frame, app);
+    } else if app.is_apr_edit_popup_open() {
+        render_apr_edit_popup(frame, app);
+    } else if app.is_extra_edit_popup_open() {
+        render_extra_edit_popup(frame, app);
     } else if app.is_interest_basis_popup_open {
         render_interest_basis_popup(frame, app);
     }
@@ -170,9 +174,9 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
                         "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10}",
                         effective_date.format_yyyy_mm_dd(),
                         "",
+                        "",
+                        "",
                         money(*amount, app.round_payments_up),
-                        "",
-                        "",
                         "",
                     )
                 }
@@ -187,6 +191,18 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD)
+            } else if let ScheduleDisplayRow::AprChangeMarker {
+                effective_date,
+                annual_interest_rate_pct,
+                ..
+            } = row
+            {
+                let is_higher = app
+                    .prior_effective_rate_before_date(*effective_date)
+                    .map(|prev| *annual_interest_rate_pct > prev)
+                    .unwrap_or(false);
+                let color = if is_higher { Color::Red } else { Color::Green };
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -220,8 +236,12 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
-    let main_help = if app.is_row_rate_popup_open {
-        "Row editor: tab/up/down switch field | type | backspace | enter apply | d clear APR | esc cancel"
+    let main_help = if app.is_row_action_popup_open() {
+        "Row action: up/down/j/k select | enter choose | esc cancel"
+    } else if app.is_apr_edit_popup_open() {
+        "APR dialog: up/down/j/k navigate | type | backspace | enter activate row | esc cancel"
+    } else if app.is_extra_edit_popup_open() {
+        "Extra dialog: up/down/j/k navigate | type | backspace | enter activate row | esc cancel"
     } else if app.is_interest_basis_popup_open {
         "Interest basis: up/down/j/k select | enter apply | esc cancel"
     } else {
@@ -247,106 +267,222 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(help, area);
 }
 
-fn render_row_rate_popup(frame: &mut Frame, app: &App) {
-    let popup_area = centered_rect(58, 34, frame.area());
+fn render_row_action_popup(frame: &mut Frame, app: &App) {
+    let options = RowActionOption::ALL;
+    let list_height = options.len() as u16 + 2;
+    let footer_height = 4;
+    let popup_area = centered_rect_exact(44, list_height + footer_height, frame.area());
     frame.render_widget(Clear, popup_area);
 
-    let selected_row = app.selected_schedule_row();
-    let row_date = selected_row.map(|row| row.date());
-    let row_date_display = row_date
-        .map(|date| date.format_yyyy_mm_dd())
-        .unwrap_or_else(|| "--".to_string());
-    let selected_row_label = match selected_row {
-        Some(ScheduleDisplayRow::Payment { month_index, .. }) => {
-            let month_label = app.format_schedule_month(month_index);
-            format!("Payment M{month_index} ({month_label})")
-        }
-        Some(ScheduleDisplayRow::AprChangeMarker { target_month, .. }) => {
-            format!("APR Change (targets M{target_month})")
-        }
-        Some(ScheduleDisplayRow::ExtraPaymentMarker { target_month, .. }) => {
-            format!("Extra Payment (targets M{target_month})")
-        }
-        None => "None".to_string(),
-    };
+    let [list_area, footer_area] = Layout::vertical([
+        Constraint::Length(list_height),
+        Constraint::Length(footer_height),
+    ])
+    .areas(popup_area);
 
-    let effective_display = row_date
-        .and_then(|date| app.effective_rate_for_date(date))
-        .map(format_rate)
-        .unwrap_or_else(|| "--".to_string());
-    let override_display = row_date
-        .and_then(|date| app.override_for_date(date))
-        .map(format_rate)
-        .unwrap_or_else(|| "--".to_string());
-    let extra_display = row_date
-        .and_then(|date| app.extra_payment_for_date(date))
-        .map(|value| money(value, app.round_payments_up))
-        .unwrap_or_else(|| "--".to_string());
+    let row_width = list_area.width.saturating_sub(2) as usize;
+    let mut rows = Vec::with_capacity(options.len());
+    for (idx, option) in options.iter().enumerate() {
+        let text = format!("{:<width$}", option.label(), width = row_width);
+        let style = if idx == app.row_action_selected_index {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        rows.push(Line::styled(text, style));
+    }
 
-    let date_marker = if app.row_rate_popup_active_field == RowRatePopupField::EffectiveDate {
-        ">"
-    } else {
-        " "
-    };
-    let apr_marker = if app.row_rate_popup_active_field == RowRatePopupField::Apr {
-        ">"
-    } else {
-        " "
-    };
-    let extra_marker = if app.row_rate_popup_active_field == RowRatePopupField::ExtraPayment {
-        ">"
-    } else {
-        " "
-    };
-    let date_input_display = if app.row_rate_date_input_buffer.is_empty() {
-        "<empty>".to_string()
-    } else {
-        app.row_rate_date_input_buffer.clone()
-    };
-    let apr_input_display = if app.row_rate_apr_input_buffer.is_empty() {
-        "<empty>".to_string()
-    } else {
-        app.row_rate_apr_input_buffer.clone()
-    };
-    let extra_input_display = if app.row_rate_extra_input_buffer.is_empty() {
-        "<empty>".to_string()
-    } else {
-        app.row_rate_extra_input_buffer.clone()
-    };
-
-    let popup_lines = vec![
-        Line::from(format!("Selected Row:   {selected_row_label}")),
-        Line::from(format!("Selected Date:  {row_date_display}")),
-        Line::from(format!("Effective APR:  {effective_display}%")),
-        Line::from(format!("Override APR:   {override_display}%")),
-        Line::from(format!("Extra Payment:  {extra_display}")),
-        Line::from(""),
-        Line::from(format!(
-            "{date_marker} Effective Date Input: {date_input_display}"
-        )),
-        Line::from(format!(
-            "{apr_marker} APR Input:            {apr_input_display}"
-        )),
-        Line::from(format!(
-            "{extra_marker} Extra Payment Input:  {extra_input_display}"
-        )),
-        Line::from(""),
-        Line::styled(
-            "Tab/Up/Down switch field | Enter apply | d clear APR | Esc cancel",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ];
-
-    let popup = Paragraph::new(Text::from(popup_lines))
+    let list = Paragraph::new(Text::from(rows))
         .block(
             Block::default()
-                .title(" Row Editor ")
+                .title(" Row Action ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         )
         .wrap(Wrap { trim: false });
+    frame.render_widget(list, list_area);
 
-    frame.render_widget(popup, popup_area);
+    let selected_option = app.row_action_selected_option();
+    let footer = Paragraph::new(Text::from(vec![Line::from(selected_option.description())]))
+        .block(
+            Block::default()
+                .title(" Selected Option ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: true });
+    frame.render_widget(footer, footer_area);
+}
+
+fn render_apr_edit_popup(frame: &mut Frame, app: &App) {
+    let rows = [
+        format!(
+            "Effective Date: {}",
+            input_or_empty(&app.apr_edit_date_input_buffer)
+        ),
+        format!(
+            "APR (%): {}",
+            input_or_empty(&app.apr_edit_apr_input_buffer)
+        ),
+        "Apply APR change".to_string(),
+        "Clear APR change".to_string(),
+        "Cancel".to_string(),
+    ];
+    let list_height = rows.len() as u16 + 2;
+    let footer_height = 4;
+    let popup_area = centered_rect_exact(62, list_height + footer_height, frame.area());
+    frame.render_widget(Clear, popup_area);
+
+    let [list_area, footer_area] = Layout::vertical([
+        Constraint::Length(list_height),
+        Constraint::Length(footer_height),
+    ])
+    .areas(popup_area);
+
+    let row_width = list_area.width.saturating_sub(2) as usize;
+    let mut lines = Vec::with_capacity(rows.len());
+    for (idx, row_text) in rows.iter().enumerate() {
+        let text = format!("{:<width$}", row_text, width = row_width);
+        let style = if idx == app.apr_edit_active_row {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(text, style));
+    }
+
+    let list = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .title(" APR Change ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(list, list_area);
+
+    let footer_hint = match app.apr_edit_active_row {
+        0 => "Enter date in YYYY-MM-DD.",
+        1 => "Enter APR value in percent (e.g. 4.99).",
+        2 => "Apply APR change at this date.",
+        3 => "Remove APR change at this date.",
+        _ => "Close dialog without changes.",
+    };
+
+    let apr_info = DateYmd::parse_yyyy_mm_dd(app.apr_edit_date_input_buffer.trim())
+        .map(|date| {
+            let effective = app
+                .effective_rate_for_date(date)
+                .map(format_rate)
+                .unwrap_or_else(|| "--".to_string());
+            let override_rate = app
+                .override_for_date(date)
+                .map(format_rate)
+                .unwrap_or_else(|| "--".to_string());
+            format!("Effective APR: {effective}% | Override: {override_rate}%")
+        })
+        .unwrap_or_else(|| "Effective APR: -- | Override: --".to_string());
+
+    let footer = Paragraph::new(Text::from(vec![
+        Line::from(footer_hint),
+        Line::from(apr_info),
+    ]))
+    .block(
+        Block::default()
+            .title(" Details ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    )
+    .wrap(Wrap { trim: true });
+    frame.render_widget(footer, footer_area);
+}
+
+fn render_extra_edit_popup(frame: &mut Frame, app: &App) {
+    let rows = [
+        format!(
+            "Effective Date: {}",
+            input_or_empty(&app.extra_edit_date_input_buffer)
+        ),
+        format!(
+            "Extra Payment: {}",
+            input_or_empty(&app.extra_edit_amount_input_buffer)
+        ),
+        "Apply extra payment".to_string(),
+        "Clear extra payment".to_string(),
+        "Cancel".to_string(),
+    ];
+    let list_height = rows.len() as u16 + 2;
+    let footer_height = 4;
+    let popup_area = centered_rect_exact(62, list_height + footer_height, frame.area());
+    frame.render_widget(Clear, popup_area);
+
+    let [list_area, footer_area] = Layout::vertical([
+        Constraint::Length(list_height),
+        Constraint::Length(footer_height),
+    ])
+    .areas(popup_area);
+
+    let row_width = list_area.width.saturating_sub(2) as usize;
+    let mut lines = Vec::with_capacity(rows.len());
+    for (idx, row_text) in rows.iter().enumerate() {
+        let text = format!("{:<width$}", row_text, width = row_width);
+        let style = if idx == app.extra_edit_active_row {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(text, style));
+    }
+
+    let list = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .title(" Extra Payment ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(list, list_area);
+
+    let footer_hint = match app.extra_edit_active_row {
+        0 => "Enter date in YYYY-MM-DD.",
+        1 => "Enter payment amount (0 removes existing value).",
+        2 => "Apply extra payment for this date.",
+        3 => "Remove extra payment at this date.",
+        _ => "Close dialog without changes.",
+    };
+
+    let extra_info = DateYmd::parse_yyyy_mm_dd(app.extra_edit_date_input_buffer.trim())
+        .map(|date| {
+            let existing = app
+                .extra_payment_for_date(date)
+                .map(|value| money(value, app.round_payments_up))
+                .unwrap_or_else(|| "--".to_string());
+            format!("Existing extra payment: {existing}")
+        })
+        .unwrap_or_else(|| "Existing extra payment: --".to_string());
+
+    let footer = Paragraph::new(Text::from(vec![
+        Line::from(footer_hint),
+        Line::from(extra_info),
+    ]))
+    .block(
+        Block::default()
+            .title(" Details ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    )
+    .wrap(Wrap { trim: true });
+    frame.render_widget(footer, footer_area);
 }
 
 fn render_interest_basis_popup(frame: &mut Frame, app: &App) {
@@ -482,6 +618,14 @@ fn format_rate(value: f64) -> String {
     format!("{value:.3}")
 }
 
+fn input_or_empty(value: &str) -> String {
+    if value.trim().is_empty() {
+        "<empty>".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn panel_border_style(base_color: Color, is_active: bool) -> Style {
     if is_active {
         Style::default()
@@ -490,26 +634,6 @@ fn panel_border_style(base_color: Color, is_active: bool) -> Style {
     } else {
         Style::default().fg(base_color)
     }
-}
-
-fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
-    let vertical = Layout::vertical([
-        Constraint::Percentage((100 - height_percent) / 2),
-        Constraint::Percentage(height_percent),
-        Constraint::Percentage((100 - height_percent) / 2),
-    ])
-    .flex(Flex::Center)
-    .split(area);
-
-    let horizontal = Layout::horizontal([
-        Constraint::Percentage((100 - width_percent) / 2),
-        Constraint::Percentage(width_percent),
-        Constraint::Percentage((100 - width_percent) / 2),
-    ])
-    .flex(Flex::Center)
-    .split(vertical[1]);
-
-    horizontal[1]
 }
 
 fn centered_rect_exact(width: u16, height: u16, area: Rect) -> Rect {

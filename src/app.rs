@@ -1,7 +1,7 @@
 #[cfg(not(test))]
 use std::fs;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -90,10 +90,42 @@ pub enum FocusArea {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowRatePopupField {
-    EffectiveDate,
-    Apr,
-    ExtraPayment,
+pub enum RowEditPopupMode {
+    None,
+    ActionSelect,
+    AprEdit,
+    ExtraEdit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowActionOption {
+    AddExtraPayment,
+    AddAprChange,
+}
+
+impl RowActionOption {
+    pub const ALL: [RowActionOption; 2] = [
+        RowActionOption::AddExtraPayment,
+        RowActionOption::AddAprChange,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RowActionOption::AddExtraPayment => "Add extra payment",
+            RowActionOption::AddAprChange => "Add APR change",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            RowActionOption::AddExtraPayment => {
+                "Create or edit an extra principal payment on a specific date."
+            }
+            RowActionOption::AddAprChange => {
+                "Create or edit an APR override that takes effect from a specific date."
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -145,11 +177,14 @@ pub struct App {
     pub inputs: [String; TEXT_FIELD_COUNT],
     pub metrics: Option<LoanMetrics>,
     pub error: Option<String>,
-    pub is_row_rate_popup_open: bool,
-    pub row_rate_date_input_buffer: String,
-    pub row_rate_apr_input_buffer: String,
-    pub row_rate_extra_input_buffer: String,
-    pub row_rate_popup_active_field: RowRatePopupField,
+    pub row_edit_popup_mode: RowEditPopupMode,
+    pub row_action_selected_index: usize,
+    pub apr_edit_date_input_buffer: String,
+    pub apr_edit_apr_input_buffer: String,
+    pub apr_edit_active_row: usize,
+    pub extra_edit_date_input_buffer: String,
+    pub extra_edit_amount_input_buffer: String,
+    pub extra_edit_active_row: usize,
     pub is_interest_basis_popup_open: bool,
     pub interest_basis_popup_selected_index: usize,
     pub selected_month: u32,
@@ -171,11 +206,14 @@ impl Default for App {
             inputs: default_inputs(),
             metrics: None,
             error: None,
-            is_row_rate_popup_open: false,
-            row_rate_date_input_buffer: String::new(),
-            row_rate_apr_input_buffer: String::new(),
-            row_rate_extra_input_buffer: String::new(),
-            row_rate_popup_active_field: RowRatePopupField::EffectiveDate,
+            row_edit_popup_mode: RowEditPopupMode::None,
+            row_action_selected_index: 0,
+            apr_edit_date_input_buffer: String::new(),
+            apr_edit_apr_input_buffer: String::new(),
+            apr_edit_active_row: 0,
+            extra_edit_date_input_buffer: String::new(),
+            extra_edit_amount_input_buffer: String::new(),
+            extra_edit_active_row: 0,
             is_interest_basis_popup_open: false,
             interest_basis_popup_selected_index: 0,
             selected_month: 1,
@@ -198,7 +236,7 @@ impl Default for App {
 
 impl App {
     pub fn is_any_popup_open(&self) -> bool {
-        self.is_row_rate_popup_open || self.is_interest_basis_popup_open
+        self.row_edit_popup_mode != RowEditPopupMode::None || self.is_interest_basis_popup_open
     }
 
     pub fn active_field(&self) -> FieldId {
@@ -334,21 +372,217 @@ impl App {
         self.ensure_schedule_selection_visible();
     }
 
-    pub fn open_row_rate_popup(&mut self) {
-        self.clamp_schedule_selection();
-        self.sync_selected_month_from_selection();
-        self.sync_row_rate_popup_inputs();
-        self.row_rate_popup_active_field = RowRatePopupField::EffectiveDate;
-        self.is_interest_basis_popup_open = false;
-        self.is_row_rate_popup_open = true;
+    pub fn is_row_action_popup_open(&self) -> bool {
+        self.row_edit_popup_mode == RowEditPopupMode::ActionSelect
     }
 
-    pub fn close_row_rate_popup(&mut self) {
-        self.is_row_rate_popup_open = false;
+    pub fn is_apr_edit_popup_open(&self) -> bool {
+        self.row_edit_popup_mode == RowEditPopupMode::AprEdit
+    }
+
+    pub fn is_extra_edit_popup_open(&self) -> bool {
+        self.row_edit_popup_mode == RowEditPopupMode::ExtraEdit
+    }
+
+    pub fn open_row_edit_popup(&mut self) {
+        self.clamp_schedule_selection();
+        self.sync_selected_month_from_selection();
+
+        match self.selected_schedule_row() {
+            Some(ScheduleDisplayRow::AprChangeMarker { .. }) => {
+                self.open_apr_edit_popup_for_selected_row()
+            }
+            Some(ScheduleDisplayRow::ExtraPaymentMarker { .. }) => {
+                self.open_extra_edit_popup_for_selected_row()
+            }
+            _ => self.open_row_action_popup_for_selected_row(),
+        }
+    }
+
+    pub fn close_row_edit_popup(&mut self) {
+        self.row_edit_popup_mode = RowEditPopupMode::None;
+    }
+
+    pub fn open_row_action_popup_for_selected_row(&mut self) {
+        self.is_interest_basis_popup_open = false;
+        self.row_action_selected_index = 0;
+        self.row_edit_popup_mode = RowEditPopupMode::ActionSelect;
+    }
+
+    pub fn row_action_move_up(&mut self) {
+        if self.row_action_selected_index == 0 {
+            return;
+        }
+
+        self.row_action_selected_index -= 1;
+    }
+
+    pub fn row_action_move_down(&mut self) {
+        if self.row_action_selected_index + 1 >= RowActionOption::ALL.len() {
+            return;
+        }
+
+        self.row_action_selected_index += 1;
+    }
+
+    pub fn row_action_selected_option(&self) -> RowActionOption {
+        RowActionOption::ALL
+            .get(self.row_action_selected_index)
+            .copied()
+            .unwrap_or(RowActionOption::AddExtraPayment)
+    }
+
+    pub fn apply_row_action_popup_selection(&mut self) {
+        match self.row_action_selected_option() {
+            RowActionOption::AddExtraPayment => self.open_extra_edit_popup_for_selected_row(),
+            RowActionOption::AddAprChange => self.open_apr_edit_popup_for_selected_row(),
+        }
+    }
+
+    pub fn open_apr_edit_popup_for_selected_row(&mut self) {
+        self.is_interest_basis_popup_open = false;
+        self.sync_apr_edit_popup_inputs();
+        self.apr_edit_active_row = 0;
+        self.row_edit_popup_mode = RowEditPopupMode::AprEdit;
+    }
+
+    pub fn apr_edit_move_up(&mut self) {
+        if self.apr_edit_active_row == 0 {
+            return;
+        }
+
+        self.apr_edit_active_row -= 1;
+    }
+
+    pub fn apr_edit_move_down(&mut self) {
+        if self.apr_edit_active_row >= 4 {
+            return;
+        }
+
+        self.apr_edit_active_row += 1;
+    }
+
+    pub fn apr_edit_input_char(&mut self, c: char) {
+        match self.apr_edit_active_row {
+            0 => {
+                if c.is_ascii_digit() || c == '-' {
+                    self.apr_edit_date_input_buffer.push(c);
+                }
+            }
+            1 => {
+                if !c.is_ascii_digit() && c != '.' {
+                    return;
+                }
+
+                if c == '.' {
+                    if self.apr_edit_apr_input_buffer.contains('.') {
+                        return;
+                    }
+                    if self.apr_edit_apr_input_buffer.is_empty() {
+                        self.apr_edit_apr_input_buffer.push('0');
+                    }
+                }
+
+                self.apr_edit_apr_input_buffer.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn apr_edit_input_backspace(&mut self) {
+        match self.apr_edit_active_row {
+            0 => {
+                self.apr_edit_date_input_buffer.pop();
+            }
+            1 => {
+                self.apr_edit_apr_input_buffer.pop();
+            }
+            _ => {}
+        }
+    }
+
+    pub fn activate_apr_edit_row_on_enter(&mut self) {
+        match self.apr_edit_active_row {
+            2 => self.apply_apr_edit_from_dialog(),
+            3 => self.clear_apr_edit_from_dialog(),
+            4 => self.close_row_edit_popup(),
+            _ => {}
+        }
+    }
+
+    pub fn open_extra_edit_popup_for_selected_row(&mut self) {
+        self.is_interest_basis_popup_open = false;
+        self.sync_extra_edit_popup_inputs();
+        self.extra_edit_active_row = 0;
+        self.row_edit_popup_mode = RowEditPopupMode::ExtraEdit;
+    }
+
+    pub fn extra_edit_move_up(&mut self) {
+        if self.extra_edit_active_row == 0 {
+            return;
+        }
+
+        self.extra_edit_active_row -= 1;
+    }
+
+    pub fn extra_edit_move_down(&mut self) {
+        if self.extra_edit_active_row >= 4 {
+            return;
+        }
+
+        self.extra_edit_active_row += 1;
+    }
+
+    pub fn extra_edit_input_char(&mut self, c: char) {
+        match self.extra_edit_active_row {
+            0 => {
+                if c.is_ascii_digit() || c == '-' {
+                    self.extra_edit_date_input_buffer.push(c);
+                }
+            }
+            1 => {
+                if !c.is_ascii_digit() && c != '.' {
+                    return;
+                }
+
+                if c == '.' {
+                    if self.extra_edit_amount_input_buffer.contains('.') {
+                        return;
+                    }
+                    if self.extra_edit_amount_input_buffer.is_empty() {
+                        self.extra_edit_amount_input_buffer.push('0');
+                    }
+                }
+
+                self.extra_edit_amount_input_buffer.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn extra_edit_input_backspace(&mut self) {
+        match self.extra_edit_active_row {
+            0 => {
+                self.extra_edit_date_input_buffer.pop();
+            }
+            1 => {
+                self.extra_edit_amount_input_buffer.pop();
+            }
+            _ => {}
+        }
+    }
+
+    pub fn activate_extra_edit_row_on_enter(&mut self) {
+        match self.extra_edit_active_row {
+            2 => self.apply_extra_edit_from_dialog(),
+            3 => self.clear_extra_edit_from_dialog(),
+            4 => self.close_row_edit_popup(),
+            _ => {}
+        }
     }
 
     pub fn open_interest_basis_popup(&mut self) {
-        self.is_row_rate_popup_open = false;
+        self.row_edit_popup_mode = RowEditPopupMode::None;
         self.is_interest_basis_popup_open = true;
         self.interest_basis_popup_selected_index = InterestBasisMode::ALL
             .iter()
@@ -395,35 +629,6 @@ impl App {
             .get(self.interest_basis_popup_selected_index)
             .copied()
             .unwrap_or(self.interest_basis_mode)
-    }
-
-    pub fn row_rate_popup_next_field(&mut self) {
-        self.row_rate_popup_active_field = match self.row_rate_popup_active_field {
-            RowRatePopupField::EffectiveDate => RowRatePopupField::Apr,
-            RowRatePopupField::Apr => RowRatePopupField::ExtraPayment,
-            RowRatePopupField::ExtraPayment => RowRatePopupField::EffectiveDate,
-        };
-    }
-
-    pub fn row_rate_popup_previous_field(&mut self) {
-        self.row_rate_popup_active_field = match self.row_rate_popup_active_field {
-            RowRatePopupField::EffectiveDate => RowRatePopupField::ExtraPayment,
-            RowRatePopupField::Apr => RowRatePopupField::EffectiveDate,
-            RowRatePopupField::ExtraPayment => RowRatePopupField::Apr,
-        };
-    }
-
-    pub fn format_schedule_month(&self, month_index: u32) -> String {
-        if month_index == 0 {
-            return "---- --".to_string();
-        }
-
-        let Some(start_date) = try_parse_date(self.field_value(FieldId::StartDate)) else {
-            return "---- --".to_string();
-        };
-
-        let (year, month) = add_months(start_date.year, start_date.month, month_index as i32);
-        format!("{year:04}-{month:02}")
     }
 
     pub fn input_char(&mut self, c: char) {
@@ -484,12 +689,15 @@ impl App {
         self.inputs = default_inputs();
         self.active_field_idx = 0;
         self.error = None;
-        self.is_row_rate_popup_open = false;
+        self.row_edit_popup_mode = RowEditPopupMode::None;
         self.is_interest_basis_popup_open = false;
-        self.row_rate_date_input_buffer.clear();
-        self.row_rate_apr_input_buffer.clear();
-        self.row_rate_extra_input_buffer.clear();
-        self.row_rate_popup_active_field = RowRatePopupField::EffectiveDate;
+        self.row_action_selected_index = 0;
+        self.apr_edit_date_input_buffer.clear();
+        self.apr_edit_apr_input_buffer.clear();
+        self.apr_edit_active_row = 0;
+        self.extra_edit_date_input_buffer.clear();
+        self.extra_edit_amount_input_buffer.clear();
+        self.extra_edit_active_row = 0;
         self.interest_basis_popup_selected_index = 0;
         self.selected_month = 1;
         self.round_payments_up = false;
@@ -546,133 +754,6 @@ impl App {
         }
     }
 
-    pub fn row_rate_input_char(&mut self, c: char) {
-        match self.row_rate_popup_active_field {
-            RowRatePopupField::EffectiveDate => {
-                if c.is_ascii_digit() || c == '-' {
-                    self.row_rate_date_input_buffer.push(c);
-                }
-            }
-            RowRatePopupField::Apr | RowRatePopupField::ExtraPayment => {
-                if !c.is_ascii_digit() && c != '.' {
-                    return;
-                }
-
-                let buffer = if self.row_rate_popup_active_field == RowRatePopupField::Apr {
-                    &mut self.row_rate_apr_input_buffer
-                } else {
-                    &mut self.row_rate_extra_input_buffer
-                };
-
-                if c == '.' {
-                    if buffer.contains('.') {
-                        return;
-                    }
-
-                    if buffer.is_empty() {
-                        buffer.push('0');
-                    }
-                }
-
-                buffer.push(c);
-            }
-        }
-    }
-
-    pub fn row_rate_input_backspace(&mut self) {
-        match self.row_rate_popup_active_field {
-            RowRatePopupField::EffectiveDate => {
-                self.row_rate_date_input_buffer.pop();
-            }
-            RowRatePopupField::Apr => {
-                self.row_rate_apr_input_buffer.pop();
-            }
-            RowRatePopupField::ExtraPayment => {
-                self.row_rate_extra_input_buffer.pop();
-            }
-        }
-    }
-
-    pub fn apply_row_rate_override_at_selected_month(&mut self) {
-        let date = match parse_date_input_for_row_edit(&self.row_rate_date_input_buffer) {
-            Ok(date) => date,
-            Err(err) => {
-                self.error = Some(err);
-                return;
-            }
-        };
-
-        let mut rate_changed = false;
-        let apr_trimmed = self.row_rate_apr_input_buffer.trim();
-        if !apr_trimmed.is_empty() {
-            match apr_trimmed.parse::<f64>() {
-                Ok(parsed) if parsed.is_finite() && parsed >= 0.0 => {
-                    self.rate_overrides.insert(date, parsed);
-                    rate_changed = true;
-                }
-                _ => {
-                    self.error =
-                        Some("Rate override APR must be a non-negative number".to_string());
-                    return;
-                }
-            }
-        }
-
-        let mut extra_changed = false;
-        let extra_trimmed = self.row_rate_extra_input_buffer.trim();
-        if !extra_trimmed.is_empty() {
-            match extra_trimmed.parse::<f64>() {
-                Ok(parsed) if parsed.is_finite() && parsed >= 0.0 => {
-                    if parsed == 0.0 {
-                        if self.extra_payments.remove(&date).is_some() {
-                            extra_changed = true;
-                        }
-                    } else {
-                        let next_amount =
-                            self.extra_payments.get(&date).copied().unwrap_or(0.0) + parsed;
-                        self.extra_payments.insert(date, next_amount);
-                        extra_changed = true;
-                    }
-                }
-                _ => {
-                    self.error = Some("Extra payment must be a non-negative number".to_string());
-                    return;
-                }
-            }
-        }
-
-        self.error = None;
-        self.persist_state_silently();
-        self.recalculate();
-
-        let preferred_row = if extra_changed {
-            ScheduleRowSelectionPreference::Extra
-        } else if rate_changed {
-            ScheduleRowSelectionPreference::Apr
-        } else {
-            ScheduleRowSelectionPreference::Payment
-        };
-        self.select_schedule_row_by_date(date, preferred_row);
-        self.is_row_rate_popup_open = false;
-    }
-
-    pub fn clear_row_rate_override_at_selected_month(&mut self) {
-        let date = match parse_date_input_for_row_edit(&self.row_rate_date_input_buffer) {
-            Ok(date) => date,
-            Err(err) => {
-                self.error = Some(err);
-                return;
-            }
-        };
-
-        self.rate_overrides.remove(&date);
-        self.error = None;
-        self.persist_state_silently();
-        self.recalculate();
-        self.select_schedule_row_by_date(date, ScheduleRowSelectionPreference::Payment);
-        self.is_row_rate_popup_open = false;
-    }
-
     pub fn override_for_date(&self, date: DateYmd) -> Option<f64> {
         self.rate_overrides.get(&date).copied()
     }
@@ -689,6 +770,20 @@ impl App {
         .ok()?;
 
         for (_, override_rate) in self.rate_overrides.range(..=date) {
+            effective = *override_rate;
+        }
+
+        Some(effective)
+    }
+
+    pub fn prior_effective_rate_before_date(&self, date: DateYmd) -> Option<f64> {
+        let mut effective = parse_f64(
+            FieldId::InterestRate,
+            self.field_value(FieldId::InterestRate),
+        )
+        .ok()?;
+
+        for (_, override_rate) in self.rate_overrides.range(..date) {
             effective = *override_rate;
         }
 
@@ -785,20 +880,19 @@ impl App {
         }
     }
 
-    fn sync_row_rate_popup_inputs(&mut self) {
+    fn sync_apr_edit_popup_inputs(&mut self) {
         let Some(row) = self
             .schedule_rows
             .get(self.schedule_selected_index)
             .copied()
         else {
-            self.row_rate_date_input_buffer.clear();
-            self.row_rate_apr_input_buffer.clear();
-            self.row_rate_extra_input_buffer.clear();
+            self.apr_edit_date_input_buffer.clear();
+            self.apr_edit_apr_input_buffer.clear();
             return;
         };
 
         let selected_date = row.date();
-        self.row_rate_date_input_buffer = selected_date.format_yyyy_mm_dd();
+        self.apr_edit_date_input_buffer = selected_date.format_yyyy_mm_dd();
 
         let apr = match row {
             ScheduleDisplayRow::Payment { payment_date, .. } => {
@@ -814,16 +908,142 @@ impl App {
         };
 
         if let Some(apr) = apr {
-            self.row_rate_apr_input_buffer = format_rate_for_input(apr);
+            self.apr_edit_apr_input_buffer = format_rate_for_input(apr);
         } else {
-            self.row_rate_apr_input_buffer.clear();
+            self.apr_edit_apr_input_buffer.clear();
+        }
+    }
+
+    fn sync_extra_edit_popup_inputs(&mut self) {
+        let Some(row) = self
+            .schedule_rows
+            .get(self.schedule_selected_index)
+            .copied()
+        else {
+            self.extra_edit_date_input_buffer.clear();
+            self.extra_edit_amount_input_buffer.clear();
+            return;
+        };
+
+        let selected_date = row.date();
+        self.extra_edit_date_input_buffer = selected_date.format_yyyy_mm_dd();
+
+        let amount = match row {
+            ScheduleDisplayRow::ExtraPaymentMarker { amount, .. } => Some(amount),
+            _ => self.extra_payments.get(&selected_date).copied(),
+        };
+
+        if let Some(amount) = amount {
+            self.extra_edit_amount_input_buffer = format_rate_for_input(amount);
+        } else {
+            self.extra_edit_amount_input_buffer.clear();
+        }
+    }
+
+    fn apply_apr_edit_from_dialog(&mut self) {
+        let date = match parse_date_input_for_row_edit(&self.apr_edit_date_input_buffer) {
+            Ok(date) => date,
+            Err(err) => {
+                self.error = Some(err);
+                return;
+            }
+        };
+
+        let apr_trimmed = self.apr_edit_apr_input_buffer.trim();
+        if apr_trimmed.is_empty() {
+            self.error = Some("APR is required".to_string());
+            return;
         }
 
-        if let Some(extra_payment_amount) = self.extra_payments.get(&selected_date).copied() {
-            self.row_rate_extra_input_buffer = format_rate_for_input(extra_payment_amount);
-        } else {
-            self.row_rate_extra_input_buffer.clear();
+        let parsed = match apr_trimmed.parse::<f64>() {
+            Ok(parsed) if parsed.is_finite() && parsed >= 0.0 => parsed,
+            _ => {
+                self.error = Some("APR must be a non-negative number".to_string());
+                return;
+            }
+        };
+
+        self.rate_overrides.insert(date, parsed);
+        self.error = None;
+        self.persist_state_silently();
+        self.recalculate();
+        self.select_schedule_row_by_date(date, ScheduleRowSelectionPreference::Apr);
+        self.close_row_edit_popup();
+    }
+
+    fn clear_apr_edit_from_dialog(&mut self) {
+        let date = match parse_date_input_for_row_edit(&self.apr_edit_date_input_buffer) {
+            Ok(date) => date,
+            Err(err) => {
+                self.error = Some(err);
+                return;
+            }
+        };
+
+        self.rate_overrides.remove(&date);
+        self.error = None;
+        self.persist_state_silently();
+        self.recalculate();
+        self.select_schedule_row_by_date(date, ScheduleRowSelectionPreference::Payment);
+        self.close_row_edit_popup();
+    }
+
+    fn apply_extra_edit_from_dialog(&mut self) {
+        let date = match parse_date_input_for_row_edit(&self.extra_edit_date_input_buffer) {
+            Ok(date) => date,
+            Err(err) => {
+                self.error = Some(err);
+                return;
+            }
+        };
+
+        let amount_trimmed = self.extra_edit_amount_input_buffer.trim();
+        if amount_trimmed.is_empty() {
+            self.error = Some("Extra payment amount is required".to_string());
+            return;
         }
+
+        let parsed = match amount_trimmed.parse::<f64>() {
+            Ok(parsed) if parsed.is_finite() && parsed >= 0.0 => parsed,
+            _ => {
+                self.error = Some("Extra payment must be a non-negative number".to_string());
+                return;
+            }
+        };
+
+        if parsed == 0.0 {
+            self.extra_payments.remove(&date);
+        } else {
+            self.extra_payments.insert(date, parsed);
+        }
+
+        self.error = None;
+        self.persist_state_silently();
+        self.recalculate();
+        let preference = if parsed == 0.0 {
+            ScheduleRowSelectionPreference::Payment
+        } else {
+            ScheduleRowSelectionPreference::Extra
+        };
+        self.select_schedule_row_by_date(date, preference);
+        self.close_row_edit_popup();
+    }
+
+    fn clear_extra_edit_from_dialog(&mut self) {
+        let date = match parse_date_input_for_row_edit(&self.extra_edit_date_input_buffer) {
+            Ok(date) => date,
+            Err(err) => {
+                self.error = Some(err);
+                return;
+            }
+        };
+
+        self.extra_payments.remove(&date);
+        self.error = None;
+        self.persist_state_silently();
+        self.recalculate();
+        self.select_schedule_row_by_date(date, ScheduleRowSelectionPreference::Payment);
+        self.close_row_edit_popup();
     }
 
     pub fn selected_schedule_row(&self) -> Option<ScheduleDisplayRow> {
@@ -839,12 +1059,6 @@ impl App {
             return;
         };
 
-        let payment_dates: BTreeSet<DateYmd> = metrics
-            .repayment_schedule
-            .iter()
-            .map(|entry| entry.payment_date)
-            .collect();
-
         for (schedule_index, entry) in metrics.repayment_schedule.iter().enumerate() {
             self.schedule_rows.push(ScheduleDisplayRow::Payment {
                 schedule_index,
@@ -854,10 +1068,6 @@ impl App {
         }
 
         for (effective_date, annual_interest_rate_pct) in &self.rate_overrides {
-            if payment_dates.contains(effective_date) {
-                continue;
-            }
-
             let target_month = metrics
                 .repayment_schedule
                 .iter()
@@ -1458,7 +1668,7 @@ fn last_day_of_month(year: i32, month: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, ScheduleDisplayRow};
+    use super::{App, RowActionOption, ScheduleDisplayRow};
     use crate::model::{DateYmd, InterestBasisMode};
 
     #[test]
@@ -1484,27 +1694,26 @@ mod tests {
     }
 
     #[test]
-    fn row_popup_apply_and_clear_selected_month_override() {
+    fn payment_row_opens_action_popup_and_selection_opens_apr_dialog() {
         let mut app = App::default();
         app.focus_schedule();
         app.move_schedule_selection(14);
-        let selected_date = app
-            .selected_schedule_row()
-            .expect("selected row should exist")
-            .date();
+        app.open_row_edit_popup();
 
-        app.open_row_rate_popup();
-        app.row_rate_apr_input_buffer = "7.25".to_string();
-        app.apply_row_rate_override_at_selected_month();
+        assert!(app.is_row_action_popup_open());
+        assert_eq!(
+            app.row_action_selected_option(),
+            RowActionOption::AddExtraPayment
+        );
 
-        assert_eq!(app.selected_month, 15);
-        assert_eq!(app.override_for_date(selected_date), Some(7.25));
-        assert!(!app.is_row_rate_popup_open);
+        app.row_action_move_down();
+        assert_eq!(
+            app.row_action_selected_option(),
+            RowActionOption::AddAprChange
+        );
+        app.apply_row_action_popup_selection();
 
-        app.open_row_rate_popup();
-        app.clear_row_rate_override_at_selected_month();
-        assert_eq!(app.override_for_date(selected_date), None);
-        assert!(!app.is_row_rate_popup_open);
+        assert!(app.is_apr_edit_popup_open());
     }
 
     #[test]
@@ -1540,7 +1749,7 @@ mod tests {
     }
 
     #[test]
-    fn payment_date_override_does_not_create_marker_row() {
+    fn payment_date_override_creates_marker_row() {
         let mut app = App::default();
         app.inputs[5] = "2026-09-12".to_string();
         app.inputs[6] = "15".to_string();
@@ -1550,63 +1759,120 @@ mod tests {
         app.rate_overrides.insert(month_two_payment_date, 7.0);
         app.recalculate();
 
-        assert!(app
-            .schedule_rows
-            .iter()
-            .all(|row| !matches!(row, ScheduleDisplayRow::AprChangeMarker { effective_date, .. } if *effective_date == month_two_payment_date)));
-    }
-
-    #[test]
-    fn row_popup_adds_and_removes_extra_payment_for_date() {
-        let mut app = App::default();
-        app.inputs[5] = "2026-09-12".to_string();
-        app.inputs[6] = "15".to_string();
-        app.recalculate();
-        app.focus_schedule();
-
-        let extra_date = DateYmd::from_ymd_opt(2026, 11, 1).expect("valid date");
-        app.open_row_rate_popup();
-        app.row_rate_date_input_buffer = extra_date.format_yyyy_mm_dd();
-        app.row_rate_apr_input_buffer.clear();
-        app.row_rate_extra_input_buffer = "2500".to_string();
-        app.apply_row_rate_override_at_selected_month();
-
-        assert_eq!(app.extra_payment_for_date(extra_date), Some(2500.0));
         assert!(app.schedule_rows.iter().any(|row| {
             matches!(
                 row,
-                ScheduleDisplayRow::ExtraPaymentMarker {
-                    effective_date,
-                    amount,
-                    target_month
-                } if *effective_date == extra_date && (*amount - 2500.0).abs() < 1e-9 && *target_month == 2
+                ScheduleDisplayRow::AprChangeMarker { effective_date, .. }
+                    if *effective_date == month_two_payment_date
             )
         }));
-
-        app.open_row_rate_popup();
-        app.row_rate_date_input_buffer = extra_date.format_yyyy_mm_dd();
-        app.row_rate_apr_input_buffer.clear();
-        app.row_rate_extra_input_buffer = "0".to_string();
-        app.apply_row_rate_override_at_selected_month();
-
-        assert_eq!(app.extra_payment_for_date(extra_date), None);
     }
 
     #[test]
-    fn row_popup_blank_extra_input_keeps_existing_extra_payment() {
+    fn marker_rows_open_corresponding_dialog_directly() {
         let mut app = App::default();
-        let extra_date = DateYmd::from_ymd_opt(2026, 11, 1).expect("valid date");
-        app.extra_payments.insert(extra_date, 1500.0);
+        app.inputs[5] = "2026-09-12".to_string();
+        app.inputs[6] = "15".to_string();
+        let apr_date = DateYmd::from_ymd_opt(2026, 11, 1).expect("valid date");
+        let extra_date = DateYmd::from_ymd_opt(2026, 12, 1).expect("valid date");
+        app.rate_overrides.insert(apr_date, 7.35);
+        app.extra_payments.insert(extra_date, 2500.0);
         app.recalculate();
         app.focus_schedule();
 
-        app.open_row_rate_popup();
-        app.row_rate_date_input_buffer = extra_date.format_yyyy_mm_dd();
-        app.row_rate_apr_input_buffer.clear();
-        app.row_rate_extra_input_buffer.clear();
-        app.apply_row_rate_override_at_selected_month();
+        let apr_marker_index = app
+            .schedule_rows
+            .iter()
+            .position(|row| {
+                matches!(row, ScheduleDisplayRow::AprChangeMarker { effective_date, .. } if *effective_date == apr_date)
+            })
+            .expect("APR marker row should exist");
+        app.schedule_selected_index = apr_marker_index;
+        app.open_row_edit_popup();
+        assert!(app.is_apr_edit_popup_open());
+        assert_eq!(app.apr_edit_date_input_buffer, apr_date.format_yyyy_mm_dd());
+        assert_eq!(app.apr_edit_apr_input_buffer, "7.35");
 
-        assert_eq!(app.extra_payment_for_date(extra_date), Some(1500.0));
+        app.close_row_edit_popup();
+
+        let extra_marker_index = app
+            .schedule_rows
+            .iter()
+            .position(|row| {
+                matches!(row, ScheduleDisplayRow::ExtraPaymentMarker { effective_date, .. } if *effective_date == extra_date)
+            })
+            .expect("Extra marker row should exist");
+        app.schedule_selected_index = extra_marker_index;
+        app.open_row_edit_popup();
+        assert!(app.is_extra_edit_popup_open());
+        assert_eq!(
+            app.extra_edit_date_input_buffer,
+            extra_date.format_yyyy_mm_dd()
+        );
+        assert_eq!(app.extra_edit_amount_input_buffer, "2500");
+    }
+
+    #[test]
+    fn apr_dialog_applies_and_clears_override() {
+        let mut app = App::default();
+        app.focus_schedule();
+        app.move_schedule_selection(14);
+        let selected_date = app
+            .selected_schedule_row()
+            .expect("selected row should exist")
+            .date();
+
+        app.open_row_edit_popup();
+        app.row_action_move_down();
+        app.apply_row_action_popup_selection();
+        assert!(app.is_apr_edit_popup_open());
+
+        app.apr_edit_apr_input_buffer = "7.25".to_string();
+        app.apr_edit_active_row = 2;
+        app.activate_apr_edit_row_on_enter();
+
+        assert_eq!(app.override_for_date(selected_date), Some(7.25));
+        assert!(!app.is_apr_edit_popup_open());
+
+        app.open_row_edit_popup();
+        app.row_action_move_down();
+        app.apply_row_action_popup_selection();
+        app.apr_edit_active_row = 3;
+        app.activate_apr_edit_row_on_enter();
+        assert_eq!(app.override_for_date(selected_date), None);
+        assert!(!app.is_apr_edit_popup_open());
+    }
+
+    #[test]
+    fn extra_dialog_replaces_existing_amount_and_can_clear() {
+        let mut app = App::default();
+        app.focus_schedule();
+        app.move_schedule_selection(14);
+        let selected_date = app
+            .selected_schedule_row()
+            .expect("selected row should exist")
+            .date();
+        app.extra_payments.insert(selected_date, 1500.0);
+        app.recalculate();
+
+        app.open_row_edit_popup();
+        assert!(app.is_row_action_popup_open());
+        app.apply_row_action_popup_selection();
+        assert!(app.is_extra_edit_popup_open());
+        assert_eq!(app.extra_edit_amount_input_buffer, "1500");
+
+        app.extra_edit_amount_input_buffer = "2500".to_string();
+        app.extra_edit_active_row = 2;
+        app.activate_extra_edit_row_on_enter();
+        assert_eq!(app.extra_payment_for_date(selected_date), Some(2500.0));
+        assert!(!app.is_extra_edit_popup_open());
+
+        app.open_row_edit_popup();
+        app.apply_row_action_popup_selection();
+        app.extra_edit_amount_input_buffer = "0".to_string();
+        app.extra_edit_active_row = 2;
+        app.activate_extra_edit_row_on_enter();
+        assert_eq!(app.extra_payment_for_date(selected_date), None);
     }
 
     #[test]
