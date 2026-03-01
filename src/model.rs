@@ -72,6 +72,14 @@ pub struct ExtraPayment {
     pub amount: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RecurringExtraPayment {
+    pub start_date: DateYmd,
+    pub month: u32,
+    pub day: u32,
+    pub amount: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterestBasisMode {
     Act365Fixed,
@@ -149,6 +157,17 @@ pub struct RepaymentScheduleEntry {
 pub struct AppliedExtraPaymentEntry {
     pub effective_date: DateYmd,
     pub applied_amount: f64,
+    pub source: AppliedExtraPaymentSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppliedExtraPaymentSource {
+    OneTime,
+    Recurring {
+        start_date: DateYmd,
+        month: u32,
+        day: u32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +183,7 @@ pub struct LoanInput {
     pub payment_day: u32,
     pub rate_overrides: Vec<RateOverride>,
     pub extra_payments: Vec<ExtraPayment>,
+    pub recurring_extra_payments: Vec<RecurringExtraPayment>,
 }
 
 #[derive(Debug, Clone)]
@@ -216,8 +236,43 @@ pub enum CalcError {
     },
     #[error("extra payment amount for date {date} must be a finite number >= 0")]
     InvalidExtraPaymentAmount { date: DateYmd },
+    #[error("recurring extra payment start date {date} is out of range ({min_date}..={max_date})")]
+    InvalidRecurringExtraPaymentStartDate {
+        date: DateYmd,
+        min_date: DateYmd,
+        max_date: DateYmd,
+    },
+    #[error(
+        "recurring extra payment month/day ({month:02}-{day:02}) for start date {start_date} must be valid in range month 1..=12, day 1..=31"
+    )]
+    InvalidRecurringExtraPaymentMonthDay {
+        start_date: DateYmd,
+        month: u32,
+        day: u32,
+    },
+    #[error(
+        "recurring extra payment amount for start date {start_date} and annual date {month:02}-{day:02} must be a finite number >= 0"
+    )]
+    InvalidRecurringExtraPaymentAmount {
+        start_date: DateYmd,
+        month: u32,
+        day: u32,
+    },
     #[error("selected month {month} is out of range (1..={max_month})")]
     InvalidSelectedMonth { month: u32, max_month: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RecurringExtraPaymentKey {
+    start_date: DateYmd,
+    month: u32,
+    day: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ExtraPaymentEvent {
+    amount: f64,
+    source: AppliedExtraPaymentSource,
 }
 
 pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanMetrics, CalcError> {
@@ -266,10 +321,21 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
         normalize_rate_overrides(&input.rate_overrides, input.start_date, last_payment_date)?;
     let extra_payments =
         normalize_extra_payments(&input.extra_payments, input.start_date, last_payment_date)?;
+    let recurring_extra_payments = normalize_recurring_extra_payments(
+        &input.recurring_extra_payments,
+        input.start_date,
+        last_payment_date,
+    )?;
+    let extra_payment_events = build_extra_payment_events(
+        &extra_payments,
+        &recurring_extra_payments,
+        input.start_date,
+        last_payment_date,
+    );
     let interest_basis_mode = input.interest_basis_mode;
 
     let mut remaining_principal = input.loan_amount;
-    let mut segments = Vec::with_capacity(rate_overrides.len() + extra_payments.len() + 1);
+    let mut segments = Vec::with_capacity(rate_overrides.len() + extra_payment_events.len() + 1);
     let mut repayment_schedule = Vec::with_capacity(total_months as usize);
     let mut applied_extra_payments = Vec::new();
     let mut current_segment_start_month = 1_u32;
@@ -279,10 +345,10 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
     let mut recompute_monthly_payment_at_month_start = false;
     let mut rounded_interest_carry = 0.0_f64;
 
-    apply_extra_payment_on_date(
+    apply_extra_payments_on_date(
         &mut remaining_principal,
         input.start_date,
-        &extra_payments,
+        &extra_payment_events,
         &mut applied_extra_payments,
     );
 
@@ -307,7 +373,7 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
                         start_month_anchor,
                         input.base_annual_interest_rate_pct,
                         &rate_overrides,
-                        &extra_payments,
+                        &extra_payment_events,
                         &mut applied_extra_payments,
                         interest_basis_mode,
                     );
@@ -315,10 +381,10 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
                 arrears_interest_signed = arrears_interest;
                 had_extra_payment_before_scheduled_payment |= had_arrears_extra_payment;
 
-                if apply_extra_payment_on_date(
+                if apply_extra_payments_on_date(
                     &mut principal_for_regular_period,
                     start_month_anchor,
-                    &extra_payments,
+                    &extra_payment_events,
                     &mut applied_extra_payments,
                 ) {
                     had_extra_payment_before_scheduled_payment = true;
@@ -342,7 +408,7 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
                 payment_date,
                 input.base_annual_interest_rate_pct,
                 &rate_overrides,
-                &extra_payments,
+                &extra_payment_events,
                 &mut applied_extra_payments,
                 interest_basis_mode,
             );
@@ -440,10 +506,10 @@ pub fn calculate_metrics(input: &LoanInput, selected_month: u32) -> Result<LoanM
             remaining_principal = 0.0;
         }
 
-        let had_same_day_extra_payment = apply_extra_payment_on_date(
+        let had_same_day_extra_payment = apply_extra_payments_on_date(
             &mut remaining_principal,
             payment_date,
-            &extra_payments,
+            &extra_payment_events,
             &mut applied_extra_payments,
         );
         recompute_monthly_payment_at_month_start = had_same_day_extra_payment;
@@ -610,38 +676,162 @@ fn normalize_extra_payments(
     Ok(normalized)
 }
 
-fn apply_extra_payment_on_date(
+fn normalize_recurring_extra_payments(
+    recurring_extra_payments: &[RecurringExtraPayment],
+    start_date: DateYmd,
+    last_payment_date: DateYmd,
+) -> Result<BTreeMap<RecurringExtraPaymentKey, f64>, CalcError> {
+    let mut normalized = BTreeMap::new();
+
+    for recurring in recurring_extra_payments {
+        if recurring.start_date < start_date || recurring.start_date > last_payment_date {
+            return Err(CalcError::InvalidRecurringExtraPaymentStartDate {
+                date: recurring.start_date,
+                min_date: start_date,
+                max_date: last_payment_date,
+            });
+        }
+
+        if recurring.month == 0 || recurring.month > 12 || recurring.day == 0 || recurring.day > 31
+        {
+            return Err(CalcError::InvalidRecurringExtraPaymentMonthDay {
+                start_date: recurring.start_date,
+                month: recurring.month,
+                day: recurring.day,
+            });
+        }
+
+        if !recurring.amount.is_finite() || recurring.amount < 0.0 {
+            return Err(CalcError::InvalidRecurringExtraPaymentAmount {
+                start_date: recurring.start_date,
+                month: recurring.month,
+                day: recurring.day,
+            });
+        }
+
+        if recurring.amount == 0.0 {
+            continue;
+        }
+
+        let key = RecurringExtraPaymentKey {
+            start_date: recurring.start_date,
+            month: recurring.month,
+            day: recurring.day,
+        };
+        let entry = normalized.entry(key).or_insert(0.0);
+        *entry += recurring.amount;
+    }
+
+    Ok(normalized)
+}
+
+fn build_extra_payment_events(
+    one_time_extra_payments: &BTreeMap<DateYmd, f64>,
+    recurring_extra_payments: &BTreeMap<RecurringExtraPaymentKey, f64>,
+    start_date: DateYmd,
+    last_payment_date: DateYmd,
+) -> BTreeMap<DateYmd, Vec<ExtraPaymentEvent>> {
+    let mut events: BTreeMap<DateYmd, Vec<ExtraPaymentEvent>> = BTreeMap::new();
+
+    for (date, amount) in one_time_extra_payments {
+        if *amount <= 0.0 {
+            continue;
+        }
+
+        events.entry(*date).or_default().push(ExtraPaymentEvent {
+            amount: *amount,
+            source: AppliedExtraPaymentSource::OneTime,
+        });
+    }
+
+    for (key, amount) in recurring_extra_payments {
+        if *amount <= 0.0 {
+            continue;
+        }
+
+        let mut year = start_date.year.max(key.start_date.year);
+        while year <= last_payment_date.year {
+            let day = key.day.min(last_day_of_month(year, key.month));
+            let Some(candidate_date) = DateYmd::from_ymd_opt(year, key.month, day) else {
+                year += 1;
+                continue;
+            };
+
+            if candidate_date >= key.start_date
+                && candidate_date >= start_date
+                && candidate_date <= last_payment_date
+            {
+                events
+                    .entry(candidate_date)
+                    .or_default()
+                    .push(ExtraPaymentEvent {
+                        amount: *amount,
+                        source: AppliedExtraPaymentSource::Recurring {
+                            start_date: key.start_date,
+                            month: key.month,
+                            day: key.day,
+                        },
+                    });
+            }
+
+            year += 1;
+        }
+    }
+
+    for per_day_events in events.values_mut() {
+        per_day_events.sort_by_key(|event| match event.source {
+            AppliedExtraPaymentSource::OneTime => 0_u8,
+            AppliedExtraPaymentSource::Recurring { .. } => 1_u8,
+        });
+    }
+
+    events
+}
+
+fn apply_extra_payments_on_date(
     principal: &mut f64,
     date: DateYmd,
-    extra_payments: &BTreeMap<DateYmd, f64>,
+    extra_payments: &BTreeMap<DateYmd, Vec<ExtraPaymentEvent>>,
     applied_extra_payments: &mut Vec<AppliedExtraPaymentEntry>,
 ) -> bool {
     if *principal <= 0.0 {
         return false;
     }
 
-    let Some(extra_amount) = extra_payments.get(&date).copied() else {
+    let Some(events_on_date) = extra_payments.get(&date) else {
         return false;
     };
-    if extra_amount <= 0.0 {
-        return false;
+
+    let mut had_any = false;
+
+    for event in events_on_date {
+        if *principal <= 0.0 {
+            break;
+        }
+
+        if event.amount <= 0.0 {
+            continue;
+        }
+
+        let applied_amount = principal.min(event.amount);
+        if applied_amount <= 0.0 {
+            continue;
+        }
+
+        *principal -= applied_amount;
+        if principal.abs() < 1e-8 {
+            *principal = 0.0;
+        }
+
+        applied_extra_payments.push(AppliedExtraPaymentEntry {
+            effective_date: date,
+            applied_amount,
+            source: event.source,
+        });
+        had_any = true;
     }
 
-    let applied_amount = principal.min(extra_amount);
-    if applied_amount <= 0.0 {
-        return false;
-    }
-
-    *principal -= applied_amount;
-    if principal.abs() < 1e-8 {
-        *principal = 0.0;
-    }
-
-    applied_extra_payments.push(AppliedExtraPaymentEntry {
-        effective_date: date,
-        applied_amount,
-    });
-    true
+    had_any
 }
 
 fn simulate_period_daily_with_events(
@@ -650,7 +840,7 @@ fn simulate_period_daily_with_events(
     period_end: DateYmd,
     base_annual_interest_rate_pct: f64,
     rate_overrides: &BTreeMap<DateYmd, f64>,
-    extra_payments: &BTreeMap<DateYmd, f64>,
+    extra_payments: &BTreeMap<DateYmd, Vec<ExtraPaymentEvent>>,
     applied_extra_payments: &mut Vec<AppliedExtraPaymentEntry>,
     interest_basis_mode: InterestBasisMode,
 ) -> (f64, f64, bool) {
@@ -671,8 +861,8 @@ fn simulate_period_daily_with_events(
         let next_extra_payment_date =
             extra_payments
                 .range(cursor..period_end)
-                .find_map(|(date, amount)| {
-                    if *date > cursor && *amount > 0.0 {
+                .find_map(|(date, per_day_events)| {
+                    if *date > cursor && per_day_events.iter().any(|event| event.amount > 0.0) {
                         Some(*date)
                     } else {
                         None
@@ -702,7 +892,7 @@ fn simulate_period_daily_with_events(
         if let Some(override_rate) = rate_overrides.get(&segment_end).copied() {
             segment_rate = override_rate;
         }
-        if apply_extra_payment_on_date(
+        if apply_extra_payments_on_date(
             &mut principal,
             segment_end,
             extra_payments,

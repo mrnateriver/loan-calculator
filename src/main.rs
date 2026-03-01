@@ -71,6 +71,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App) 
             handle_apr_edit_popup_key(&mut app, key_event);
         } else if app.is_extra_edit_popup_open() {
             handle_extra_edit_popup_key(&mut app, key_event);
+        } else if app.is_recurring_extra_edit_popup_open() {
+            handle_recurring_extra_edit_popup_key(&mut app, key_event);
         } else if app.is_interest_basis_popup_open {
             handle_interest_basis_popup_key(&mut app, key_event);
         } else {
@@ -186,6 +188,26 @@ fn handle_extra_edit_popup_key(app: &mut App, key_event: KeyEvent) {
             if key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT =>
         {
             app.extra_edit_input_char(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_recurring_extra_edit_popup_key(app: &mut App, key_event: KeyEvent) {
+    match key_event.code {
+        KeyCode::Esc => app.close_row_edit_popup(),
+        KeyCode::Enter => app.activate_recurring_extra_edit_row_on_enter(),
+        KeyCode::Up => app.recurring_extra_edit_move_up(),
+        KeyCode::Down => app.recurring_extra_edit_move_down(),
+        KeyCode::Char('k') if key_event.modifiers.is_empty() => app.recurring_extra_edit_move_up(),
+        KeyCode::Char('j') if key_event.modifiers.is_empty() => {
+            app.recurring_extra_edit_move_down()
+        }
+        KeyCode::Backspace => app.recurring_extra_edit_input_backspace(),
+        KeyCode::Char(c)
+            if key_event.modifiers.is_empty() || key_event.modifiers == KeyModifiers::SHIFT =>
+        {
+            app.recurring_extra_edit_input_char(c);
         }
         _ => {}
     }

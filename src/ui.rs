@@ -40,6 +40,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_apr_edit_popup(frame, app);
     } else if app.is_extra_edit_popup_open() {
         render_extra_edit_popup(frame, app);
+    } else if app.is_recurring_extra_edit_popup_open() {
+        render_recurring_extra_edit_popup(frame, app);
     } else if app.is_interest_basis_popup_open {
         render_interest_basis_popup(frame, app);
     }
@@ -128,28 +130,55 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
 
         lines.push(Line::styled(
             format!(
-                "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10}",
-                "Date", "APR(%)", "Payment", "Interest", "Principal", "Fees"
+                "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10} {:>12}",
+                "Date", "APR(%)", "Payment", "Interest", "Principal", "Fees", "Saldo"
             ),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ));
 
+        let mut running_balance = metrics.purchase_price_estimate;
+        let mut balance_after_row = Vec::with_capacity(total_rows);
+        for row in &app.schedule_rows {
+            let principal_delta = match row {
+                ScheduleDisplayRow::Payment { schedule_index, .. } => {
+                    metrics.repayment_schedule[*schedule_index].principal_payment
+                }
+                ScheduleDisplayRow::ExtraPaymentMarker { amount, .. }
+                | ScheduleDisplayRow::RecurringExtraPaymentMarker { amount, .. } => *amount,
+                ScheduleDisplayRow::AprChangeMarker { .. } => 0.0,
+            };
+
+            if principal_delta > 0.0 {
+                running_balance = (running_balance - principal_delta).max(0.0);
+                if running_balance.abs() < 1e-9 {
+                    running_balance = 0.0;
+                }
+            }
+            balance_after_row.push(running_balance);
+        }
+
         for (visible_idx, row) in app.schedule_rows[offset..end].iter().enumerate() {
             let absolute_idx = offset + visible_idx;
             let is_selected = absolute_idx == app.schedule_selected_index;
+            let saldo_text = if matches!(row, ScheduleDisplayRow::AprChangeMarker { .. }) {
+                String::new()
+            } else {
+                money(balance_after_row[absolute_idx], app.round_payments_up)
+            };
             let line = match row {
                 ScheduleDisplayRow::Payment { schedule_index, .. } => {
                     let entry = &metrics.repayment_schedule[*schedule_index];
                     format!(
-                        "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10}",
+                        "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10} {:>12}",
                         entry.payment_date.format_yyyy_mm_dd(),
                         format_rate(entry.effective_annual_interest_rate_pct),
                         money(entry.total_payment, app.round_payments_up),
                         money(entry.interest_payment, app.round_payments_up),
                         money(entry.principal_payment, app.round_payments_up),
                         money(entry.fees_payment, app.round_payments_up),
+                        saldo_text,
                     )
                 }
                 ScheduleDisplayRow::AprChangeMarker {
@@ -158,9 +187,10 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
                     ..
                 } => {
                     format!(
-                        "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10}",
+                        "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10} {:>12}",
                         effective_date.format_yyyy_mm_dd(),
                         format_rate(*annual_interest_rate_pct),
+                        "",
                         "",
                         "",
                         "",
@@ -173,15 +203,37 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
                     ..
                 } => {
                     format!(
-                        "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10}",
+                        "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10} {:>12}",
                         effective_date.format_yyyy_mm_dd(),
                         "",
                         "",
                         "",
                         money(*amount, app.round_payments_up),
                         "",
+                        saldo_text,
                     )
                 }
+                ScheduleDisplayRow::RecurringExtraPaymentMarker {
+                    effective_date,
+                    amount,
+                    ..
+                } => {
+                    format!(
+                        "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10} {:>12}",
+                        effective_date.format_yyyy_mm_dd(),
+                        "",
+                        "",
+                        "",
+                        money(*amount, app.round_payments_up),
+                        "",
+                        saldo_text,
+                    )
+                }
+            };
+            let line = if matches!(row, ScheduleDisplayRow::RecurringExtraPaymentMarker { .. }) {
+                format!("{line} *")
+            } else {
+                line
             };
 
             let style = if is_selected {
@@ -189,7 +241,11 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
                     .fg(Color::Black)
                     .bg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
-            } else if matches!(row, ScheduleDisplayRow::ExtraPaymentMarker { .. }) {
+            } else if matches!(
+                row,
+                ScheduleDisplayRow::ExtraPaymentMarker { .. }
+                    | ScheduleDisplayRow::RecurringExtraPaymentMarker { .. }
+            ) {
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD)
@@ -246,6 +302,8 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         "APR dialog: up/down/j/k navigate | type | backspace | enter activate row | esc cancel"
     } else if app.is_extra_edit_popup_open() {
         "Extra dialog: up/down/j/k navigate | type | backspace | enter activate row | esc cancel"
+    } else if app.is_recurring_extra_edit_popup_open() {
+        "Recurring dialog: up/down/j/k navigate | type | backspace | enter activate row | esc cancel"
     } else if app.is_interest_basis_popup_open {
         "Interest basis: up/down/j/k select | enter apply | esc cancel"
     } else {
@@ -587,6 +645,80 @@ fn render_interest_basis_popup(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .title(" Selected Option ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: true });
+    frame.render_widget(footer, footer_area);
+}
+
+fn render_recurring_extra_edit_popup(frame: &mut Frame, app: &App) {
+    let rows = [
+        format!(
+            "Start Date: {}",
+            input_or_empty(&app.recurring_edit_start_date_input_buffer)
+        ),
+        format!(
+            "Annual Date (MM-DD): {}",
+            input_or_empty(&app.recurring_edit_annual_date_input_buffer)
+        ),
+        format!(
+            "Recurring Extra Payment: {}",
+            input_or_empty(&app.recurring_edit_amount_input_buffer)
+        ),
+        "Apply recurring extra payment".to_string(),
+        "Clear recurring extra payment".to_string(),
+        "Cancel".to_string(),
+    ];
+    let list_height = rows.len() as u16 + 2;
+    let footer_height = 4;
+    let popup_area = centered_rect_exact(66, list_height + footer_height, frame.area());
+    frame.render_widget(Clear, popup_area);
+
+    let [list_area, footer_area] = Layout::vertical([
+        Constraint::Length(list_height),
+        Constraint::Length(footer_height),
+    ])
+    .areas(popup_area);
+
+    let row_width = list_area.width.saturating_sub(2) as usize;
+    let mut lines = Vec::with_capacity(rows.len());
+    for (idx, row_text) in rows.iter().enumerate() {
+        let text = format!("{:<width$}", row_text, width = row_width);
+        let style = if idx == app.recurring_edit_active_row {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(text, style));
+    }
+
+    let list = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .title(" Recurring Extra Payment ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(list, list_area);
+
+    let footer_hint = match app.recurring_edit_active_row {
+        0 => "Enter start date in YYYY-MM-DD.",
+        1 => "Enter annual month/day in MM-DD format.",
+        2 => "Enter recurring payment amount (0 removes existing value).",
+        3 => "Apply recurring extra payment rule.",
+        4 => "Remove recurring extra payment rule.",
+        _ => "Close dialog without changes.",
+    };
+
+    let footer = Paragraph::new(Text::from(vec![Line::from(footer_hint)]))
+        .block(
+            Block::default()
+                .title(" Details ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )

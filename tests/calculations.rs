@@ -3,7 +3,8 @@ mod model;
 
 use approx::assert_relative_eq;
 use model::{
-    CalcError, DateYmd, ExtraPayment, InterestBasisMode, LoanInput, RateOverride, calculate_metrics,
+    AppliedExtraPaymentSource, CalcError, DateYmd, ExtraPayment, InterestBasisMode, LoanInput,
+    RateOverride, RecurringExtraPayment, calculate_metrics,
 };
 
 fn sample_input() -> LoanInput {
@@ -19,6 +20,7 @@ fn sample_input() -> LoanInput {
         payment_day: 15,
         rate_overrides: vec![],
         extra_payments: vec![],
+        recurring_extra_payments: vec![],
     }
 }
 
@@ -721,5 +723,78 @@ fn rejects_invalid_extra_payment_inputs() {
     assert_eq!(
         err,
         CalcError::InvalidExtraPaymentAmount { date: valid_date }
+    );
+}
+
+#[test]
+fn recurring_extra_payment_applies_on_matching_annual_dates() {
+    let mut input = sample_input();
+    input.recurring_extra_payments = vec![RecurringExtraPayment {
+        start_date: DateYmd::from_ymd_opt(2026, 10, 10).expect("valid date"),
+        month: 11,
+        day: 1,
+        amount: 2_000.0,
+    }];
+
+    let metrics = calculate_metrics(&input, 3).expect("calculation should succeed");
+
+    let first_applied = metrics
+        .applied_extra_payments
+        .iter()
+        .find(|entry| entry.effective_date == DateYmd::from_ymd_opt(2026, 11, 1).expect("valid"))
+        .expect("first recurring payment occurrence should be applied");
+    assert_relative_eq!(first_applied.applied_amount, 2_000.0, epsilon = 1e-9);
+    assert_eq!(
+        first_applied.source,
+        AppliedExtraPaymentSource::Recurring {
+            start_date: DateYmd::from_ymd_opt(2026, 10, 10).expect("valid"),
+            month: 11,
+            day: 1,
+        }
+    );
+
+    assert!(
+        metrics.applied_extra_payments.iter().any(|entry| {
+            entry.effective_date == DateYmd::from_ymd_opt(2027, 11, 1).expect("valid")
+        }),
+        "next year recurring occurrence should also be applied"
+    );
+}
+
+#[test]
+fn rejects_invalid_recurring_extra_payment_inputs() {
+    let mut before_start = sample_input();
+    before_start.recurring_extra_payments = vec![RecurringExtraPayment {
+        start_date: DateYmd::from_ymd_opt(2026, 8, 12).expect("valid date"),
+        month: 12,
+        day: 1,
+        amount: 500.0,
+    }];
+    let err = calculate_metrics(&before_start, 1)
+        .expect_err("should reject start date before loan start");
+    assert_eq!(
+        err,
+        CalcError::InvalidRecurringExtraPaymentStartDate {
+            date: DateYmd::from_ymd_opt(2026, 8, 12).expect("valid date"),
+            min_date: before_start.start_date,
+            max_date: DateYmd::from_ymd_opt(2056, 9, 15).expect("valid end date"),
+        }
+    );
+
+    let mut invalid_day = sample_input();
+    invalid_day.recurring_extra_payments = vec![RecurringExtraPayment {
+        start_date: DateYmd::from_ymd_opt(2026, 10, 1).expect("valid date"),
+        month: 2,
+        day: 0,
+        amount: 500.0,
+    }];
+    let err = calculate_metrics(&invalid_day, 1).expect_err("should reject invalid month/day");
+    assert_eq!(
+        err,
+        CalcError::InvalidRecurringExtraPaymentMonthDay {
+            start_date: DateYmd::from_ymd_opt(2026, 10, 1).expect("valid date"),
+            month: 2,
+            day: 0,
+        }
     );
 }

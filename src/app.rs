@@ -6,8 +6,8 @@ use std::{
 };
 
 use crate::model::{
-    DateYmd, ExtraPayment, InterestBasisMode, LoanInput, LoanMetrics, RateOverride,
-    calculate_metrics,
+    AppliedExtraPaymentSource, DateYmd, ExtraPayment, InterestBasisMode, LoanInput, LoanMetrics,
+    RateOverride, RecurringExtraPayment, calculate_metrics,
 };
 
 const TEXT_FIELD_COUNT: usize = 7;
@@ -95,24 +95,28 @@ pub enum RowEditPopupMode {
     ActionSelect,
     AprEdit,
     ExtraEdit,
+    RecurringExtraEdit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowActionOption {
     AddExtraPayment,
     AddAprChange,
+    AddRecurringExtraPayment,
 }
 
 impl RowActionOption {
-    pub const ALL: [RowActionOption; 2] = [
+    pub const ALL: [RowActionOption; 3] = [
         RowActionOption::AddExtraPayment,
         RowActionOption::AddAprChange,
+        RowActionOption::AddRecurringExtraPayment,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             RowActionOption::AddExtraPayment => "Add extra payment",
             RowActionOption::AddAprChange => "Add APR change",
+            RowActionOption::AddRecurringExtraPayment => "Add recurring extra payment",
         }
     }
 
@@ -123,6 +127,9 @@ impl RowActionOption {
             }
             RowActionOption::AddAprChange => {
                 "Create or edit an APR override that takes effect from a specific date."
+            }
+            RowActionOption::AddRecurringExtraPayment => {
+                "Create or edit a yearly recurring extra principal payment."
             }
         }
     }
@@ -172,6 +179,14 @@ pub enum ScheduleDisplayRow {
         amount: f64,
         target_month: u32,
     },
+    RecurringExtraPaymentMarker {
+        effective_date: DateYmd,
+        amount: f64,
+        target_month: u32,
+        recurring_start_date: DateYmd,
+        recurring_month: u32,
+        recurring_day: u32,
+    },
 }
 
 impl ScheduleDisplayRow {
@@ -180,6 +195,9 @@ impl ScheduleDisplayRow {
             ScheduleDisplayRow::Payment { payment_date, .. } => payment_date,
             ScheduleDisplayRow::AprChangeMarker { effective_date, .. } => effective_date,
             ScheduleDisplayRow::ExtraPaymentMarker { effective_date, .. } => effective_date,
+            ScheduleDisplayRow::RecurringExtraPaymentMarker { effective_date, .. } => {
+                effective_date
+            }
         }
     }
 
@@ -188,8 +206,16 @@ impl ScheduleDisplayRow {
             ScheduleDisplayRow::Payment { month_index, .. } => month_index,
             ScheduleDisplayRow::AprChangeMarker { target_month, .. } => target_month,
             ScheduleDisplayRow::ExtraPaymentMarker { target_month, .. } => target_month,
+            ScheduleDisplayRow::RecurringExtraPaymentMarker { target_month, .. } => target_month,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RecurringExtraPaymentKey {
+    start_date: DateYmd,
+    month: u32,
+    day: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +223,7 @@ enum ScheduleRowSelectionPreference {
     Payment,
     Apr,
     Extra,
+    Recurring,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +239,11 @@ pub struct App {
     pub extra_edit_date_input_buffer: String,
     pub extra_edit_amount_input_buffer: String,
     pub extra_edit_active_row: usize,
+    pub recurring_edit_start_date_input_buffer: String,
+    pub recurring_edit_annual_date_input_buffer: String,
+    pub recurring_edit_amount_input_buffer: String,
+    pub recurring_edit_active_row: usize,
+    recurring_edit_source_key: Option<RecurringExtraPaymentKey>,
     pub is_reset_confirm_popup_open: bool,
     pub reset_confirm_selected_index: usize,
     pub is_interest_basis_popup_open: bool,
@@ -227,6 +259,7 @@ pub struct App {
     schedule_viewport_rows: usize,
     rate_overrides: BTreeMap<DateYmd, f64>,
     extra_payments: BTreeMap<DateYmd, f64>,
+    recurring_extra_payments: BTreeMap<RecurringExtraPaymentKey, f64>,
 }
 
 impl Default for App {
@@ -243,6 +276,11 @@ impl Default for App {
             extra_edit_date_input_buffer: String::new(),
             extra_edit_amount_input_buffer: String::new(),
             extra_edit_active_row: 0,
+            recurring_edit_start_date_input_buffer: String::new(),
+            recurring_edit_annual_date_input_buffer: String::new(),
+            recurring_edit_amount_input_buffer: String::new(),
+            recurring_edit_active_row: 0,
+            recurring_edit_source_key: None,
             is_reset_confirm_popup_open: false,
             reset_confirm_selected_index: 0,
             is_interest_basis_popup_open: false,
@@ -258,6 +296,7 @@ impl Default for App {
             schedule_viewport_rows: 1,
             rate_overrides: BTreeMap::new(),
             extra_payments: BTreeMap::new(),
+            recurring_extra_payments: BTreeMap::new(),
         };
         app.restore_state_from_disk_silently();
         app.recalculate();
@@ -417,6 +456,10 @@ impl App {
         self.row_edit_popup_mode == RowEditPopupMode::ExtraEdit
     }
 
+    pub fn is_recurring_extra_edit_popup_open(&self) -> bool {
+        self.row_edit_popup_mode == RowEditPopupMode::RecurringExtraEdit
+    }
+
     pub fn open_row_edit_popup(&mut self) {
         self.clamp_schedule_selection();
         self.sync_selected_month_from_selection();
@@ -427,6 +470,9 @@ impl App {
             }
             Some(ScheduleDisplayRow::ExtraPaymentMarker { .. }) => {
                 self.open_extra_edit_popup_for_selected_row()
+            }
+            Some(ScheduleDisplayRow::RecurringExtraPaymentMarker { .. }) => {
+                self.open_recurring_extra_edit_popup_for_selected_row()
             }
             _ => self.open_row_action_popup_for_selected_row(),
         }
@@ -470,6 +516,9 @@ impl App {
         match self.row_action_selected_option() {
             RowActionOption::AddExtraPayment => self.open_extra_edit_popup_for_selected_row(),
             RowActionOption::AddAprChange => self.open_apr_edit_popup_for_selected_row(),
+            RowActionOption::AddRecurringExtraPayment => {
+                self.open_recurring_extra_edit_popup_for_selected_row()
+            }
         }
     }
 
@@ -613,6 +662,82 @@ impl App {
             2 => self.apply_extra_edit_from_dialog(),
             3 => self.clear_extra_edit_from_dialog(),
             4 => self.close_row_edit_popup(),
+            _ => {}
+        }
+    }
+
+    pub fn open_recurring_extra_edit_popup_for_selected_row(&mut self) {
+        self.is_interest_basis_popup_open = false;
+        self.is_reset_confirm_popup_open = false;
+        self.sync_recurring_extra_edit_popup_inputs();
+        self.recurring_edit_active_row = 0;
+        self.row_edit_popup_mode = RowEditPopupMode::RecurringExtraEdit;
+    }
+
+    pub fn recurring_extra_edit_move_up(&mut self) {
+        if self.recurring_edit_active_row == 0 {
+            return;
+        }
+        self.recurring_edit_active_row -= 1;
+    }
+
+    pub fn recurring_extra_edit_move_down(&mut self) {
+        if self.recurring_edit_active_row >= 5 {
+            return;
+        }
+        self.recurring_edit_active_row += 1;
+    }
+
+    pub fn recurring_extra_edit_input_char(&mut self, c: char) {
+        match self.recurring_edit_active_row {
+            0 => {
+                if c.is_ascii_digit() || c == '-' {
+                    self.recurring_edit_start_date_input_buffer.push(c);
+                }
+            }
+            1 => {
+                if c.is_ascii_digit() || c == '-' {
+                    self.recurring_edit_annual_date_input_buffer.push(c);
+                }
+            }
+            2 => {
+                if !c.is_ascii_digit() && c != '.' {
+                    return;
+                }
+                if c == '.' {
+                    if self.recurring_edit_amount_input_buffer.contains('.') {
+                        return;
+                    }
+                    if self.recurring_edit_amount_input_buffer.is_empty() {
+                        self.recurring_edit_amount_input_buffer.push('0');
+                    }
+                }
+                self.recurring_edit_amount_input_buffer.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn recurring_extra_edit_input_backspace(&mut self) {
+        match self.recurring_edit_active_row {
+            0 => {
+                self.recurring_edit_start_date_input_buffer.pop();
+            }
+            1 => {
+                self.recurring_edit_annual_date_input_buffer.pop();
+            }
+            2 => {
+                self.recurring_edit_amount_input_buffer.pop();
+            }
+            _ => {}
+        }
+    }
+
+    pub fn activate_recurring_extra_edit_row_on_enter(&mut self) {
+        match self.recurring_edit_active_row {
+            3 => self.apply_recurring_extra_edit_from_dialog(),
+            4 => self.clear_recurring_extra_edit_from_dialog(),
+            5 => self.close_row_edit_popup(),
             _ => {}
         }
     }
@@ -776,6 +901,11 @@ impl App {
         self.extra_edit_date_input_buffer.clear();
         self.extra_edit_amount_input_buffer.clear();
         self.extra_edit_active_row = 0;
+        self.recurring_edit_start_date_input_buffer.clear();
+        self.recurring_edit_annual_date_input_buffer.clear();
+        self.recurring_edit_amount_input_buffer.clear();
+        self.recurring_edit_active_row = 0;
+        self.recurring_edit_source_key = None;
         self.interest_basis_popup_selected_index = 0;
         self.selected_month = 1;
         self.round_payments_up = false;
@@ -786,6 +916,7 @@ impl App {
         self.schedule_scroll_offset = 0;
         self.rate_overrides.clear();
         self.extra_payments.clear();
+        self.recurring_extra_payments.clear();
         self.persist_state_silently();
         self.recalculate();
     }
@@ -879,6 +1010,14 @@ impl App {
                     && amount.is_finite()
                     && *amount > 0.0
             });
+            self.recurring_extra_payments.retain(|key, amount| {
+                key.start_date >= start_date
+                    && key.start_date <= last_payment_date
+                    && (1..=12).contains(&key.month)
+                    && (1..=31).contains(&key.day)
+                    && amount.is_finite()
+                    && *amount > 0.0
+            });
         }
 
         if self.schedule_rows.is_empty() {
@@ -900,14 +1039,15 @@ impl App {
             return self.schedule_rows.len();
         }
 
+        if self.metrics.is_some() {
+            return 0;
+        }
+
         if let Some(months) = self.term_months_from_input() {
             return months as usize;
         }
 
-        self.metrics
-            .as_ref()
-            .map(|metrics| metrics.repayment_schedule.len().max(1))
-            .unwrap_or(1)
+        1
     }
 
     fn clamp_schedule_selection(&mut self) {
@@ -980,7 +1120,8 @@ impl App {
                 annual_interest_rate_pct,
                 ..
             } => Some(annual_interest_rate_pct),
-            ScheduleDisplayRow::ExtraPaymentMarker { .. } => {
+            ScheduleDisplayRow::ExtraPaymentMarker { .. }
+            | ScheduleDisplayRow::RecurringExtraPaymentMarker { .. } => {
                 self.rate_overrides.get(&selected_date).copied()
             }
         };
@@ -1015,6 +1156,71 @@ impl App {
             self.extra_edit_amount_input_buffer = format_rate_for_input(amount);
         } else {
             self.extra_edit_amount_input_buffer.clear();
+        }
+    }
+
+    fn sync_recurring_extra_edit_popup_inputs(&mut self) {
+        let Some(row) = self
+            .schedule_rows
+            .get(self.schedule_selected_index)
+            .copied()
+        else {
+            self.recurring_edit_start_date_input_buffer.clear();
+            self.recurring_edit_annual_date_input_buffer.clear();
+            self.recurring_edit_amount_input_buffer.clear();
+            self.recurring_edit_source_key = None;
+            return;
+        };
+
+        let selected_date = row.date();
+        let selected_key = match row {
+            ScheduleDisplayRow::RecurringExtraPaymentMarker {
+                recurring_start_date,
+                recurring_month,
+                recurring_day,
+                ..
+            } => Some(RecurringExtraPaymentKey {
+                start_date: recurring_start_date,
+                month: recurring_month,
+                day: recurring_day,
+            }),
+            _ => None,
+        };
+
+        let key = selected_key.or_else(|| {
+            self.recurring_extra_payments
+                .keys()
+                .find(|key| {
+                    key.month == selected_date.month
+                        && key
+                            .day
+                            .min(last_day_of_month(selected_date.year, key.month))
+                            == selected_date.day
+                        && selected_date >= key.start_date
+                })
+                .copied()
+        });
+        self.recurring_edit_source_key = key;
+
+        if let Some(key) = key {
+            self.recurring_edit_start_date_input_buffer = key.start_date.format_yyyy_mm_dd();
+            self.recurring_edit_annual_date_input_buffer =
+                format!("{:02}-{:02}", key.month, key.day);
+            let amount = self
+                .recurring_extra_payments
+                .get(&key)
+                .copied()
+                .unwrap_or(0.0);
+            if amount > 0.0 {
+                self.recurring_edit_amount_input_buffer = format_rate_for_input(amount);
+            } else {
+                self.recurring_edit_amount_input_buffer.clear();
+            }
+        } else {
+            self.recurring_edit_start_date_input_buffer = selected_date.format_yyyy_mm_dd();
+            self.recurring_edit_annual_date_input_buffer =
+                format!("{:02}-{:02}", selected_date.month, selected_date.day);
+            self.recurring_edit_amount_input_buffer.clear();
         }
     }
 
@@ -1124,6 +1330,115 @@ impl App {
         self.close_row_edit_popup();
     }
 
+    fn apply_recurring_extra_edit_from_dialog(&mut self) {
+        let start_date =
+            match parse_date_input_for_row_edit(&self.recurring_edit_start_date_input_buffer) {
+                Ok(date) => date,
+                Err(err) => {
+                    self.error = Some(err);
+                    return;
+                }
+            };
+        let (month, day) =
+            match parse_annual_mm_dd_input(&self.recurring_edit_annual_date_input_buffer) {
+                Ok(month_day) => month_day,
+                Err(err) => {
+                    self.error = Some(err);
+                    return;
+                }
+            };
+
+        let amount_trimmed = self.recurring_edit_amount_input_buffer.trim();
+        if amount_trimmed.is_empty() {
+            self.error = Some("Recurring extra payment amount is required".to_string());
+            return;
+        }
+        let parsed = match amount_trimmed.parse::<f64>() {
+            Ok(parsed) if parsed.is_finite() && parsed >= 0.0 => parsed,
+            _ => {
+                self.error =
+                    Some("Recurring extra payment must be a non-negative number".to_string());
+                return;
+            }
+        };
+
+        if let Some(source_key) = self.recurring_edit_source_key {
+            if source_key.start_date != start_date
+                || source_key.month != month
+                || source_key.day != day
+            {
+                self.recurring_extra_payments.remove(&source_key);
+            }
+        }
+
+        let key = RecurringExtraPaymentKey {
+            start_date,
+            month,
+            day,
+        };
+
+        if parsed == 0.0 {
+            self.recurring_extra_payments.remove(&key);
+        } else {
+            self.recurring_extra_payments.insert(key, parsed);
+        }
+
+        self.error = None;
+        self.persist_state_silently();
+        self.recalculate();
+
+        if parsed == 0.0 {
+            self.select_schedule_row_by_date(start_date, ScheduleRowSelectionPreference::Payment);
+        } else if let Some((start_range, end_range)) = self.override_date_range_from_inputs() {
+            if let Some(occurrence_date) =
+                first_recurring_occurrence_in_range(key, start_range, end_range)
+            {
+                self.select_schedule_row_by_date(
+                    occurrence_date,
+                    ScheduleRowSelectionPreference::Recurring,
+                );
+            } else {
+                self.select_schedule_row_by_date(
+                    start_date,
+                    ScheduleRowSelectionPreference::Recurring,
+                );
+            }
+        } else {
+            self.select_schedule_row_by_date(start_date, ScheduleRowSelectionPreference::Recurring);
+        }
+
+        self.close_row_edit_popup();
+    }
+
+    fn clear_recurring_extra_edit_from_dialog(&mut self) {
+        let parsed_start =
+            parse_date_input_for_row_edit(&self.recurring_edit_start_date_input_buffer).ok();
+        let parsed_month_day =
+            parse_annual_mm_dd_input(&self.recurring_edit_annual_date_input_buffer).ok();
+
+        let key = self.recurring_edit_source_key.or_else(|| {
+            parsed_start
+                .zip(parsed_month_day)
+                .map(|(start_date, (month, day))| RecurringExtraPaymentKey {
+                    start_date,
+                    month,
+                    day,
+                })
+        });
+
+        let Some(key) = key else {
+            self.error = Some("Recurring extra payment key is invalid".to_string());
+            return;
+        };
+
+        self.recurring_extra_payments.remove(&key);
+        self.error = None;
+        self.persist_state_silently();
+        self.recalculate();
+        self.select_schedule_row_by_date(key.start_date, ScheduleRowSelectionPreference::Payment);
+        self.close_row_edit_popup();
+    }
+
     pub fn selected_schedule_row(&self) -> Option<ScheduleDisplayRow> {
         self.schedule_rows
             .get(self.schedule_selected_index)
@@ -1181,12 +1496,31 @@ impl App {
                 })
                 .unwrap_or(1);
 
-            self.schedule_rows
-                .push(ScheduleDisplayRow::ExtraPaymentMarker {
-                    effective_date: applied_extra.effective_date,
-                    amount: applied_extra.applied_amount,
-                    target_month,
-                });
+            match applied_extra.source {
+                AppliedExtraPaymentSource::OneTime => {
+                    self.schedule_rows
+                        .push(ScheduleDisplayRow::ExtraPaymentMarker {
+                            effective_date: applied_extra.effective_date,
+                            amount: applied_extra.applied_amount,
+                            target_month,
+                        });
+                }
+                AppliedExtraPaymentSource::Recurring {
+                    start_date,
+                    month,
+                    day,
+                } => {
+                    self.schedule_rows
+                        .push(ScheduleDisplayRow::RecurringExtraPaymentMarker {
+                            effective_date: applied_extra.effective_date,
+                            amount: applied_extra.applied_amount,
+                            target_month,
+                            recurring_start_date: start_date,
+                            recurring_month: month,
+                            recurring_day: day,
+                        });
+                }
+            }
         }
 
         self.schedule_rows.sort_by(|left, right| {
@@ -1197,14 +1531,49 @@ impl App {
                     ScheduleDisplayRow::Payment { .. } => 0_u8,
                     ScheduleDisplayRow::AprChangeMarker { .. } => 1_u8,
                     ScheduleDisplayRow::ExtraPaymentMarker { .. } => 2_u8,
+                    ScheduleDisplayRow::RecurringExtraPaymentMarker { .. } => 3_u8,
                 };
                 let right_priority = match right {
                     ScheduleDisplayRow::Payment { .. } => 0_u8,
                     ScheduleDisplayRow::AprChangeMarker { .. } => 1_u8,
                     ScheduleDisplayRow::ExtraPaymentMarker { .. } => 2_u8,
+                    ScheduleDisplayRow::RecurringExtraPaymentMarker { .. } => 3_u8,
                 };
                 left_priority.cmp(&right_priority)
             })
+        });
+
+        let mut running_balance = metrics.purchase_price_estimate;
+        self.schedule_rows.retain(|row| {
+            let balance_before = running_balance;
+            let principal_delta = match row {
+                ScheduleDisplayRow::Payment { schedule_index, .. } => {
+                    metrics.repayment_schedule[*schedule_index].principal_payment
+                }
+                ScheduleDisplayRow::ExtraPaymentMarker { amount, .. }
+                | ScheduleDisplayRow::RecurringExtraPaymentMarker { amount, .. } => *amount,
+                ScheduleDisplayRow::AprChangeMarker { .. } => 0.0,
+            };
+
+            if principal_delta > 0.0 {
+                running_balance = (running_balance - principal_delta).max(0.0);
+                if running_balance.abs() < 1e-9 {
+                    running_balance = 0.0;
+                }
+            }
+
+            let is_extra_marker = matches!(
+                row,
+                ScheduleDisplayRow::ExtraPaymentMarker { .. }
+                    | ScheduleDisplayRow::RecurringExtraPaymentMarker { .. }
+            );
+            let is_payoff_extra_marker =
+                is_extra_marker && balance_before > 1e-9 && running_balance <= 1e-9;
+            if is_payoff_extra_marker {
+                return true;
+            }
+
+            running_balance > 1e-9
         });
     }
 
@@ -1220,6 +1589,7 @@ impl App {
         let mut exact_payment = None;
         let mut exact_apr_marker = None;
         let mut exact_extra_marker = None;
+        let mut exact_recurring_marker = None;
         let mut next_by_date = None;
 
         for (index, row) in self.schedule_rows.iter().enumerate() {
@@ -1234,6 +1604,9 @@ impl App {
                     ScheduleDisplayRow::ExtraPaymentMarker { .. } => {
                         exact_extra_marker = Some(index)
                     }
+                    ScheduleDisplayRow::RecurringExtraPaymentMarker { .. } => {
+                        exact_recurring_marker = Some(index)
+                    }
                 }
             }
         }
@@ -1243,13 +1616,21 @@ impl App {
             ScheduleRowSelectionPreference::Payment => exact_payment
                 .or(exact_apr_marker)
                 .or(exact_extra_marker)
+                .or(exact_recurring_marker)
                 .unwrap_or(fallback),
             ScheduleRowSelectionPreference::Apr => exact_apr_marker
                 .or(exact_payment)
                 .or(exact_extra_marker)
+                .or(exact_recurring_marker)
                 .unwrap_or(fallback),
             ScheduleRowSelectionPreference::Extra => exact_extra_marker
                 .or(exact_payment)
+                .or(exact_apr_marker)
+                .or(exact_recurring_marker)
+                .unwrap_or(fallback),
+            ScheduleRowSelectionPreference::Recurring => exact_recurring_marker
+                .or(exact_payment)
+                .or(exact_extra_marker)
                 .or(exact_apr_marker)
                 .unwrap_or(fallback),
         };
@@ -1335,6 +1716,11 @@ impl App {
             if let Some(extra_obj) = extract_json_object_value(&raw_state, "extra_payments") {
                 self.extra_payments = parse_override_map_json(extra_obj);
             }
+            if let Some(recurring_obj) =
+                extract_json_object_value(&raw_state, "recurring_extra_payments")
+            {
+                self.recurring_extra_payments = parse_recurring_extra_map_json(recurring_obj);
+            }
         }
     }
 
@@ -1408,6 +1794,16 @@ impl App {
             let comma = if idx + 1 == extra_len { "" } else { "," };
             json.push_str(&format!("    \"{}\": {}{}\n", date, amount, comma));
         }
+        json.push_str("  },\n");
+        json.push_str("  \"recurring_extra_payments\": {\n");
+        let recurring_len = self.recurring_extra_payments.len();
+        for (idx, (key, amount)) in self.recurring_extra_payments.iter().enumerate() {
+            let comma = if idx + 1 == recurring_len { "" } else { "," };
+            json.push_str(&format!(
+                "    \"{}|{:02}-{:02}\": {}{}\n",
+                key.start_date, key.month, key.day, amount, comma
+            ));
+        }
         json.push_str("  }\n");
         json.push('}');
         json
@@ -1455,6 +1851,16 @@ impl App {
                 amount: *amount,
             })
             .collect();
+        let recurring_extra_payments = self
+            .recurring_extra_payments
+            .iter()
+            .map(|(key, amount)| RecurringExtraPayment {
+                start_date: key.start_date,
+                month: key.month,
+                day: key.day,
+                amount: *amount,
+            })
+            .collect();
 
         Ok(LoanInput {
             loan_amount,
@@ -1468,6 +1874,7 @@ impl App {
             payment_day,
             rate_overrides,
             extra_payments,
+            recurring_extra_payments,
         })
     }
 }
@@ -1530,6 +1937,31 @@ fn parse_date_input_for_row_edit(value: &str) -> Result<DateYmd, String> {
 
     DateYmd::parse_yyyy_mm_dd(trimmed)
         .ok_or_else(|| "Effective date must be in YYYY-MM-DD format".to_string())
+}
+
+fn parse_annual_mm_dd_input(value: &str) -> Result<(u32, u32), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Annual date is required".to_string());
+    }
+
+    let Some((month_raw, day_raw)) = trimmed.split_once('-') else {
+        return Err("Annual date must be in MM-DD format".to_string());
+    };
+
+    let month = month_raw
+        .parse::<u32>()
+        .map_err(|_| "Annual date month must be a whole number".to_string())?;
+    let day = day_raw
+        .parse::<u32>()
+        .map_err(|_| "Annual date day must be a whole number".to_string())?;
+    if month == 0 || month > 12 || day == 0 || day > 31 {
+        return Err(
+            "Annual date must be in MM-DD format with month 1..12 and day 1..31".to_string(),
+        );
+    }
+
+    Ok((month, day))
 }
 
 #[cfg(not(test))]
@@ -1682,6 +2114,94 @@ fn parse_override_map_json(raw_object: &str) -> BTreeMap<DateYmd, f64> {
     map
 }
 
+#[cfg(not(test))]
+fn parse_recurring_extra_map_json(raw_object: &str) -> BTreeMap<RecurringExtraPaymentKey, f64> {
+    let mut map = BTreeMap::new();
+    let Some(open_brace) = raw_object.find('{') else {
+        return map;
+    };
+    let Some(close_brace) = raw_object.rfind('}') else {
+        return map;
+    };
+    if close_brace <= open_brace {
+        return map;
+    }
+
+    let body = &raw_object[open_brace + 1..close_brace];
+    for raw_entry in body.split(',') {
+        let entry = raw_entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+
+        let Some(colon_idx) = entry.find(':') else {
+            continue;
+        };
+        let raw_key = entry[..colon_idx].trim();
+        let raw_value = entry[colon_idx + 1..].trim();
+        if raw_key.len() < 2 || !raw_key.starts_with('"') || !raw_key.ends_with('"') {
+            continue;
+        }
+
+        let key_str = &raw_key[1..raw_key.len() - 1];
+        let Some((start_date_raw, month_day_raw)) = key_str.split_once('|') else {
+            continue;
+        };
+        let Some((month_raw, day_raw)) = month_day_raw.split_once('-') else {
+            continue;
+        };
+
+        let Some(start_date) = DateYmd::parse_yyyy_mm_dd(start_date_raw) else {
+            continue;
+        };
+        let Ok(month) = month_raw.parse::<u32>() else {
+            continue;
+        };
+        let Ok(day) = day_raw.parse::<u32>() else {
+            continue;
+        };
+        if month == 0 || month > 12 || day == 0 || day > 31 {
+            continue;
+        }
+        let Ok(amount) = raw_value.parse::<f64>() else {
+            continue;
+        };
+        if !amount.is_finite() || amount <= 0.0 {
+            continue;
+        }
+
+        let key = RecurringExtraPaymentKey {
+            start_date,
+            month,
+            day,
+        };
+        let entry = map.entry(key).or_insert(0.0);
+        *entry += amount;
+    }
+
+    map
+}
+
+fn first_recurring_occurrence_in_range(
+    key: RecurringExtraPaymentKey,
+    range_start: DateYmd,
+    range_end: DateYmd,
+) -> Option<DateYmd> {
+    let mut year = range_start.year.max(key.start_date.year);
+    while year <= range_end.year {
+        let day = key.day.min(last_day_of_month(year, key.month));
+        let Some(candidate) = DateYmd::from_ymd_opt(year, key.month, day) else {
+            year += 1;
+            continue;
+        };
+        if candidate >= key.start_date && candidate >= range_start && candidate <= range_end {
+            return Some(candidate);
+        }
+        year += 1;
+    }
+    None
+}
+
 fn format_rate_for_input(value: f64) -> String {
     let mut formatted = format!("{value:.6}");
     while formatted.contains('.') && formatted.ends_with('0') {
@@ -1789,8 +2309,13 @@ mod tests {
             app.row_action_selected_option(),
             RowActionOption::AddAprChange
         );
+        app.row_action_move_down();
+        assert_eq!(
+            app.row_action_selected_option(),
+            RowActionOption::AddRecurringExtraPayment
+        );
+        app.row_action_move_up();
         app.apply_row_action_popup_selection();
-
         assert!(app.is_apr_edit_popup_open());
     }
 
@@ -1853,8 +2378,17 @@ mod tests {
         app.inputs[6] = "15".to_string();
         let apr_date = DateYmd::from_ymd_opt(2026, 11, 1).expect("valid date");
         let extra_date = DateYmd::from_ymd_opt(2026, 12, 1).expect("valid date");
+        let recurring_date = DateYmd::from_ymd_opt(2026, 11, 20).expect("valid date");
         app.rate_overrides.insert(apr_date, 7.35);
         app.extra_payments.insert(extra_date, 2500.0);
+        app.recurring_extra_payments.insert(
+            super::RecurringExtraPaymentKey {
+                start_date: DateYmd::from_ymd_opt(2026, 9, 12).expect("valid date"),
+                month: 11,
+                day: 20,
+            },
+            1750.0,
+        );
         app.recalculate();
         app.focus_schedule();
 
@@ -1888,6 +2422,26 @@ mod tests {
             extra_date.format_yyyy_mm_dd()
         );
         assert_eq!(app.extra_edit_amount_input_buffer, "2500");
+
+        app.close_row_edit_popup();
+
+        let recurring_marker_index = app
+            .schedule_rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    ScheduleDisplayRow::RecurringExtraPaymentMarker { effective_date, .. }
+                        if *effective_date == recurring_date
+                )
+            })
+            .expect("Recurring marker row should exist");
+        app.schedule_selected_index = recurring_marker_index;
+        app.open_row_edit_popup();
+        assert!(app.is_recurring_extra_edit_popup_open());
+        assert_eq!(app.recurring_edit_start_date_input_buffer, "2026-09-12");
+        assert_eq!(app.recurring_edit_annual_date_input_buffer, "11-20");
+        assert_eq!(app.recurring_edit_amount_input_buffer, "1750");
     }
 
     #[test]
@@ -1951,6 +2505,51 @@ mod tests {
         app.extra_edit_active_row = 2;
         app.activate_extra_edit_row_on_enter();
         assert_eq!(app.extra_payment_for_date(selected_date), None);
+    }
+
+    #[test]
+    fn recurring_dialog_can_add_edit_and_clear_rule() {
+        let mut app = App::default();
+        app.focus_schedule();
+        app.move_schedule_selection(14);
+        let selected_date = app
+            .selected_schedule_row()
+            .expect("selected row should exist")
+            .date();
+
+        app.open_row_edit_popup();
+        assert!(app.is_row_action_popup_open());
+        app.row_action_move_down();
+        app.row_action_move_down();
+        app.apply_row_action_popup_selection();
+        assert!(app.is_recurring_extra_edit_popup_open());
+
+        app.recurring_edit_start_date_input_buffer = selected_date.format_yyyy_mm_dd();
+        app.recurring_edit_annual_date_input_buffer =
+            format!("{:02}-{:02}", selected_date.month, selected_date.day);
+        app.recurring_edit_amount_input_buffer = "1200".to_string();
+        app.recurring_edit_active_row = 3;
+        app.activate_recurring_extra_edit_row_on_enter();
+        assert!(!app.is_recurring_extra_edit_popup_open());
+        assert_eq!(app.recurring_extra_payments.len(), 1);
+
+        let key = super::RecurringExtraPaymentKey {
+            start_date: selected_date,
+            month: selected_date.month,
+            day: selected_date.day,
+        };
+        assert_eq!(
+            app.recurring_extra_payments.get(&key).copied(),
+            Some(1200.0)
+        );
+
+        app.open_row_edit_popup();
+        app.row_action_move_down();
+        app.row_action_move_down();
+        app.apply_row_action_popup_selection();
+        app.recurring_edit_active_row = 4;
+        app.activate_recurring_extra_edit_row_on_enter();
+        assert_eq!(app.recurring_extra_payments.get(&key), None);
     }
 
     #[test]
