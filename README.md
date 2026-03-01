@@ -1,8 +1,8 @@
-# Mortgage Calculator TUI
+# Loan Calculator
 
 ![Screenshot](./screenshot.png)
 
-This project is a terminal-based mortgage calculator built in Rust.  
+This project is a terminal-based loan calculator built in Rust.  
 It helps you model a loan with daily-interest accrual, APR changes, fees, and extra payments, then inspect the full repayment schedule and summary totals.
 
 ## Run
