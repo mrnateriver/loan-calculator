@@ -187,6 +187,17 @@ pub enum ScheduleDisplayRow {
         recurring_month: u32,
         recurring_day: u32,
     },
+    YearSummary {
+        year: i32,
+        anchor_date: DateYmd,
+        target_month: u32,
+        apr_sum: f64,
+        payment_sum: f64,
+        interest_sum: f64,
+        principal_sum: f64,
+        fees_sum: f64,
+        saldo_after_december_payment: f64,
+    },
 }
 
 impl ScheduleDisplayRow {
@@ -198,6 +209,7 @@ impl ScheduleDisplayRow {
             ScheduleDisplayRow::RecurringExtraPaymentMarker { effective_date, .. } => {
                 effective_date
             }
+            ScheduleDisplayRow::YearSummary { anchor_date, .. } => anchor_date,
         }
     }
 
@@ -207,6 +219,7 @@ impl ScheduleDisplayRow {
             ScheduleDisplayRow::AprChangeMarker { target_month, .. } => target_month,
             ScheduleDisplayRow::ExtraPaymentMarker { target_month, .. } => target_month,
             ScheduleDisplayRow::RecurringExtraPaymentMarker { target_month, .. } => target_month,
+            ScheduleDisplayRow::YearSummary { target_month, .. } => target_month,
         }
     }
 }
@@ -474,6 +487,7 @@ impl App {
             Some(ScheduleDisplayRow::RecurringExtraPaymentMarker { .. }) => {
                 self.open_recurring_extra_edit_popup_for_selected_row()
             }
+            Some(ScheduleDisplayRow::YearSummary { .. }) => {}
             _ => self.open_row_action_popup_for_selected_row(),
         }
     }
@@ -1121,7 +1135,8 @@ impl App {
                 ..
             } => Some(annual_interest_rate_pct),
             ScheduleDisplayRow::ExtraPaymentMarker { .. }
-            | ScheduleDisplayRow::RecurringExtraPaymentMarker { .. } => {
+            | ScheduleDisplayRow::RecurringExtraPaymentMarker { .. }
+            | ScheduleDisplayRow::YearSummary { .. } => {
                 self.rate_overrides.get(&selected_date).copied()
             }
         };
@@ -1532,27 +1547,31 @@ impl App {
                     ScheduleDisplayRow::AprChangeMarker { .. } => 1_u8,
                     ScheduleDisplayRow::ExtraPaymentMarker { .. } => 2_u8,
                     ScheduleDisplayRow::RecurringExtraPaymentMarker { .. } => 3_u8,
+                    ScheduleDisplayRow::YearSummary { .. } => 4_u8,
                 };
                 let right_priority = match right {
                     ScheduleDisplayRow::Payment { .. } => 0_u8,
                     ScheduleDisplayRow::AprChangeMarker { .. } => 1_u8,
                     ScheduleDisplayRow::ExtraPaymentMarker { .. } => 2_u8,
                     ScheduleDisplayRow::RecurringExtraPaymentMarker { .. } => 3_u8,
+                    ScheduleDisplayRow::YearSummary { .. } => 4_u8,
                 };
                 left_priority.cmp(&right_priority)
             })
         });
 
         let mut running_balance = metrics.purchase_price_estimate;
-        self.schedule_rows.retain(|row| {
+        let mut filtered_rows = Vec::with_capacity(self.schedule_rows.len());
+        for row in self.schedule_rows.drain(..) {
             let balance_before = running_balance;
             let principal_delta = match row {
                 ScheduleDisplayRow::Payment { schedule_index, .. } => {
-                    metrics.repayment_schedule[*schedule_index].principal_payment
+                    metrics.repayment_schedule[schedule_index].principal_payment
                 }
                 ScheduleDisplayRow::ExtraPaymentMarker { amount, .. }
-                | ScheduleDisplayRow::RecurringExtraPaymentMarker { amount, .. } => *amount,
-                ScheduleDisplayRow::AprChangeMarker { .. } => 0.0,
+                | ScheduleDisplayRow::RecurringExtraPaymentMarker { amount, .. } => amount,
+                ScheduleDisplayRow::AprChangeMarker { .. }
+                | ScheduleDisplayRow::YearSummary { .. } => 0.0,
             };
 
             if principal_delta > 0.0 {
@@ -1562,19 +1581,181 @@ impl App {
                 }
             }
 
-            let is_extra_marker = matches!(
-                row,
-                ScheduleDisplayRow::ExtraPaymentMarker { .. }
-                    | ScheduleDisplayRow::RecurringExtraPaymentMarker { .. }
-            );
-            let is_payoff_extra_marker =
-                is_extra_marker && balance_before > 1e-9 && running_balance <= 1e-9;
-            if is_payoff_extra_marker {
-                return true;
+            let is_payoff_row =
+                principal_delta > 0.0 && balance_before > 1e-9 && running_balance <= 1e-9;
+            let keep = is_payoff_row || running_balance > 1e-9;
+            if keep {
+                filtered_rows.push(row);
+            }
+        }
+
+        let mut rebuilt = Vec::with_capacity(filtered_rows.len() + 32);
+        let terminal_year = filtered_rows.last().map(|row| row.date().year);
+        let mut current_year: Option<i32> = None;
+        let mut apr_sum = 0.0_f64;
+        let mut payment_sum = 0.0_f64;
+        let mut interest_sum = 0.0_f64;
+        let mut principal_sum = 0.0_f64;
+        let mut fees_sum = 0.0_f64;
+        let mut saldo_running = metrics.purchase_price_estimate;
+        let mut december_summary_anchor: Option<(DateYmd, u32, f64)> = None;
+        let mut last_payment_anchor_in_year: Option<(DateYmd, u32, f64)> = None;
+
+        let push_year_summary = |rows: &mut Vec<ScheduleDisplayRow>,
+                                 year: i32,
+                                 anchor: Option<(DateYmd, u32, f64)>,
+                                 apr: f64,
+                                 payment: f64,
+                                 interest: f64,
+                                 principal: f64,
+                                 fees: f64| {
+            if let Some((anchor_date, target_month, saldo)) = anchor {
+                rows.push(ScheduleDisplayRow::YearSummary {
+                    year,
+                    anchor_date,
+                    target_month,
+                    apr_sum: apr,
+                    payment_sum: payment,
+                    interest_sum: interest,
+                    principal_sum: principal,
+                    fees_sum: fees,
+                    saldo_after_december_payment: saldo,
+                });
+            }
+        };
+
+        for row in filtered_rows {
+            let row_year = row.date().year;
+            if let Some(active_year) = current_year {
+                if row_year != active_year {
+                    push_year_summary(
+                        &mut rebuilt,
+                        active_year,
+                        december_summary_anchor,
+                        apr_sum,
+                        payment_sum,
+                        interest_sum,
+                        principal_sum,
+                        fees_sum,
+                    );
+
+                    apr_sum = 0.0;
+                    payment_sum = 0.0;
+                    interest_sum = 0.0;
+                    principal_sum = 0.0;
+                    fees_sum = 0.0;
+                    december_summary_anchor = None;
+                    last_payment_anchor_in_year = None;
+                    current_year = Some(row_year);
+                }
+            } else {
+                current_year = Some(row_year);
             }
 
-            running_balance > 1e-9
-        });
+            match row {
+                ScheduleDisplayRow::Payment {
+                    schedule_index,
+                    month_index,
+                    payment_date,
+                } => {
+                    let entry = &metrics.repayment_schedule[schedule_index];
+                    apr_sum += entry.effective_annual_interest_rate_pct;
+                    payment_sum += entry.total_payment;
+                    interest_sum += entry.interest_payment;
+                    principal_sum += entry.principal_payment;
+                    fees_sum += entry.fees_payment;
+
+                    saldo_running = (saldo_running - entry.principal_payment).max(0.0);
+                    if saldo_running.abs() < 1e-9 {
+                        saldo_running = 0.0;
+                    }
+                    last_payment_anchor_in_year = Some((payment_date, month_index, saldo_running));
+
+                    if payment_date.month == 12 {
+                        december_summary_anchor = Some((payment_date, month_index, saldo_running));
+                    }
+
+                    rebuilt.push(ScheduleDisplayRow::Payment {
+                        schedule_index,
+                        month_index,
+                        payment_date,
+                    });
+                }
+                ScheduleDisplayRow::AprChangeMarker {
+                    effective_date,
+                    annual_interest_rate_pct,
+                    target_month,
+                } => {
+                    apr_sum += annual_interest_rate_pct;
+                    rebuilt.push(ScheduleDisplayRow::AprChangeMarker {
+                        effective_date,
+                        annual_interest_rate_pct,
+                        target_month,
+                    });
+                }
+                ScheduleDisplayRow::ExtraPaymentMarker {
+                    effective_date,
+                    amount,
+                    target_month,
+                } => {
+                    principal_sum += amount;
+                    saldo_running = (saldo_running - amount).max(0.0);
+                    if saldo_running.abs() < 1e-9 {
+                        saldo_running = 0.0;
+                    }
+                    rebuilt.push(ScheduleDisplayRow::ExtraPaymentMarker {
+                        effective_date,
+                        amount,
+                        target_month,
+                    });
+                }
+                ScheduleDisplayRow::RecurringExtraPaymentMarker {
+                    effective_date,
+                    amount,
+                    target_month,
+                    recurring_start_date,
+                    recurring_month,
+                    recurring_day,
+                } => {
+                    principal_sum += amount;
+                    saldo_running = (saldo_running - amount).max(0.0);
+                    if saldo_running.abs() < 1e-9 {
+                        saldo_running = 0.0;
+                    }
+                    rebuilt.push(ScheduleDisplayRow::RecurringExtraPaymentMarker {
+                        effective_date,
+                        amount,
+                        target_month,
+                        recurring_start_date,
+                        recurring_month,
+                        recurring_day,
+                    });
+                }
+                ScheduleDisplayRow::YearSummary { .. } => {}
+            }
+        }
+
+        if let Some(active_year) = current_year {
+            let summary_anchor = if december_summary_anchor.is_some() {
+                december_summary_anchor
+            } else if terminal_year == Some(active_year) {
+                last_payment_anchor_in_year
+            } else {
+                None
+            };
+            push_year_summary(
+                &mut rebuilt,
+                active_year,
+                summary_anchor,
+                apr_sum,
+                payment_sum,
+                interest_sum,
+                principal_sum,
+                fees_sum,
+            );
+        }
+
+        self.schedule_rows = rebuilt;
     }
 
     fn select_schedule_row_by_date(
@@ -1607,6 +1788,7 @@ impl App {
                     ScheduleDisplayRow::RecurringExtraPaymentMarker { .. } => {
                         exact_recurring_marker = Some(index)
                     }
+                    ScheduleDisplayRow::YearSummary { .. } => {}
                 }
             }
         }
@@ -2557,6 +2739,8 @@ mod tests {
         let mut app = App::default();
         app.focus_schedule();
         app.set_schedule_viewport_rows(5);
+        let total_rows = app.schedule_rows.len();
+        assert!(total_rows > 0);
 
         app.move_schedule_selection(6);
         assert_eq!(app.schedule_selected_index, 6);
@@ -2572,9 +2756,12 @@ mod tests {
         assert_eq!(app.schedule_scroll_offset, 0);
 
         app.move_schedule_selection_to_end();
-        assert_eq!(app.schedule_selected_index, 359);
+        assert_eq!(app.schedule_selected_index, total_rows - 1);
         assert_eq!(app.selected_month, 360);
-        assert_eq!(app.schedule_scroll_offset, 355);
+        assert_eq!(
+            app.schedule_scroll_offset,
+            total_rows.saturating_sub(app.schedule_viewport_rows)
+        );
 
         app.move_schedule_selection_to_start();
         assert_eq!(app.schedule_selected_index, 0);
@@ -2588,12 +2775,41 @@ mod tests {
         app.focus_schedule();
         app.move_schedule_selection(11);
 
+        let selected_row = app
+            .selected_schedule_row()
+            .expect("selected row should exist after moving selection");
         let metrics = app
             .metrics
             .as_ref()
             .expect("metrics should exist after moving selection");
-        assert_eq!(app.selected_month, 12);
-        assert_eq!(metrics.selected_month, 12);
+        assert_eq!(app.selected_month, selected_row.target_month());
+        assert_eq!(metrics.selected_month, selected_row.target_month());
+    }
+
+    #[test]
+    fn terminal_partial_year_still_gets_year_summary() {
+        let mut app = App::default();
+        app.inputs[5] = "2026-09-12".to_string();
+        app.inputs[6] = "15".to_string();
+        app.extra_payments.insert(
+            DateYmd::from_ymd_opt(2026, 11, 1).expect("valid date"),
+            1_000_000_000.0,
+        );
+        app.recalculate();
+
+        assert!(
+            !app.schedule_rows.iter().any(|row| {
+                matches!(row, ScheduleDisplayRow::Payment { payment_date, .. } if payment_date.year == 2026 && payment_date.month == 12)
+            }),
+            "fixture should pay off before first December payment"
+        );
+
+        assert!(app.schedule_rows.iter().any(|row| {
+            matches!(
+                row,
+                ScheduleDisplayRow::YearSummary { year, .. } if *year == 2026
+            )
+        }));
     }
 
     #[test]

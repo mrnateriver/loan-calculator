@@ -147,7 +147,8 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
                 ScheduleDisplayRow::ExtraPaymentMarker { amount, .. }
                 | ScheduleDisplayRow::RecurringExtraPaymentMarker { amount, .. } => *amount,
-                ScheduleDisplayRow::AprChangeMarker { .. } => 0.0,
+                ScheduleDisplayRow::AprChangeMarker { .. }
+                | ScheduleDisplayRow::YearSummary { .. } => 0.0,
             };
 
             if principal_delta > 0.0 {
@@ -229,6 +230,26 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
                         saldo_text,
                     )
                 }
+                ScheduleDisplayRow::YearSummary {
+                    year,
+                    payment_sum,
+                    interest_sum,
+                    principal_sum,
+                    fees_sum,
+                    saldo_after_december_payment,
+                    ..
+                } => {
+                    format!(
+                        "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10} {:>12}",
+                        format!("Y{year} Sum"),
+                        "",
+                        money(*payment_sum, app.round_payments_up),
+                        money(*interest_sum, app.round_payments_up),
+                        money(*principal_sum, app.round_payments_up),
+                        money(*fees_sum, app.round_payments_up),
+                        money(*saldo_after_december_payment, app.round_payments_up),
+                    )
+                }
             };
             let line = if matches!(row, ScheduleDisplayRow::RecurringExtraPaymentMarker { .. }) {
                 format!("{line} *")
@@ -240,6 +261,10 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if matches!(row, ScheduleDisplayRow::YearSummary { .. }) {
+                Style::default()
+                    .fg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD)
             } else if matches!(
                 row,
