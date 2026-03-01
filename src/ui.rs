@@ -13,12 +13,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let [content_area, help_area] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).areas(frame.area());
 
-    let min_schedule_height = 8;
-    let top_height = if content_area.height <= min_schedule_height {
-        content_area.height.saturating_sub(1)
+    let top_height = if content_area.height <= 3 {
+        content_area.height
     } else {
-        let candidate = content_area.height.saturating_mul(38) / 100;
-        candidate.clamp(8, content_area.height - min_schedule_height)
+        // 8 content rows + 2 border rows.
+        10.min(content_area.height - 3)
     };
 
     let [top_area, schedule_area] =
@@ -39,7 +38,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_form(frame: &mut Frame, app: &App, area: Rect) {
-    let mut lines = Vec::with_capacity(FieldId::ALL.len() + 5);
+    let mut lines = Vec::with_capacity(FieldId::ALL.len());
 
     for field in FieldId::ALL {
         let is_active = field == app.active_field() && !app.is_row_rate_popup_open;
@@ -59,17 +58,6 @@ fn render_form(frame: &mut Frame, app: &App, area: Rect) {
             style,
         ));
     }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(format!(
-        "Rate Overrides: {}",
-        app.override_count()
-    )));
-    lines.push(Line::from(format!(
-        "Selected Row Month: M{} ({})",
-        app.selected_month,
-        app.format_schedule_month(app.selected_month)
-    )));
 
     let form = Paragraph::new(Text::from(lines))
         .block(
@@ -171,12 +159,31 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
                         "",
                     )
                 }
+                ScheduleDisplayRow::ExtraPaymentMarker {
+                    effective_date,
+                    amount,
+                    ..
+                } => {
+                    format!(
+                        "{:<10} {:>8} {:>12} {:>12} {:>12} {:>10}",
+                        effective_date.format_yyyy_mm_dd(),
+                        "",
+                        money(*amount),
+                        "",
+                        "",
+                        "",
+                    )
+                }
             };
 
             let style = if is_selected {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if matches!(row, ScheduleDisplayRow::ExtraPaymentMarker { .. }) {
+                Style::default()
+                    .fg(Color::Green)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -212,9 +219,9 @@ fn render_schedule(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     let main_help = if app.is_row_rate_popup_open {
-        "APR popup: tab/up/down switch field | type | backspace | enter apply | d clear | esc cancel"
+        "Row editor: tab/up/down switch field | type | backspace | enter apply | d clear APR | esc cancel"
     } else {
-        "up/down/j/k: navigate | tab/shift+tab: switch panels | enter on schedule: edit APR | space/enter: toggle | r: reset | q: quit"
+        "up/down/j/k: navigate | tab/shift+tab: switch panels | enter on schedule: edit row | space/enter: toggle | r: reset | q: quit"
     };
 
     let mut lines = vec![Line::from(main_help)];
@@ -253,6 +260,9 @@ fn render_row_rate_popup(frame: &mut Frame, app: &App) {
         Some(ScheduleDisplayRow::AprChangeMarker { target_month, .. }) => {
             format!("APR Change (targets M{target_month})")
         }
+        Some(ScheduleDisplayRow::ExtraPaymentMarker { target_month, .. }) => {
+            format!("Extra Payment (targets M{target_month})")
+        }
         None => "None".to_string(),
     };
 
@@ -264,6 +274,10 @@ fn render_row_rate_popup(frame: &mut Frame, app: &App) {
         .and_then(|date| app.override_for_date(date))
         .map(format_rate)
         .unwrap_or_else(|| "--".to_string());
+    let extra_display = row_date
+        .and_then(|date| app.extra_payment_for_date(date))
+        .map(money)
+        .unwrap_or_else(|| "--".to_string());
 
     let date_marker = if app.row_rate_popup_active_field == RowRatePopupField::EffectiveDate {
         ">"
@@ -271,6 +285,11 @@ fn render_row_rate_popup(frame: &mut Frame, app: &App) {
         " "
     };
     let apr_marker = if app.row_rate_popup_active_field == RowRatePopupField::Apr {
+        ">"
+    } else {
+        " "
+    };
+    let extra_marker = if app.row_rate_popup_active_field == RowRatePopupField::ExtraPayment {
         ">"
     } else {
         " "
@@ -285,12 +304,18 @@ fn render_row_rate_popup(frame: &mut Frame, app: &App) {
     } else {
         app.row_rate_apr_input_buffer.clone()
     };
+    let extra_input_display = if app.row_rate_extra_input_buffer.is_empty() {
+        "<empty>".to_string()
+    } else {
+        app.row_rate_extra_input_buffer.clone()
+    };
 
     let popup_lines = vec![
         Line::from(format!("Selected Row:   {selected_row_label}")),
         Line::from(format!("Selected Date:  {row_date_display}")),
         Line::from(format!("Effective APR:  {effective_display}%")),
         Line::from(format!("Override APR:   {override_display}%")),
+        Line::from(format!("Extra Payment:  {extra_display}")),
         Line::from(""),
         Line::from(format!(
             "{date_marker} Effective Date Input: {date_input_display}"
@@ -298,9 +323,12 @@ fn render_row_rate_popup(frame: &mut Frame, app: &App) {
         Line::from(format!(
             "{apr_marker} APR Input:            {apr_input_display}"
         )),
+        Line::from(format!(
+            "{extra_marker} Extra Payment Input:  {extra_input_display}"
+        )),
         Line::from(""),
         Line::styled(
-            "Tab/Up/Down switch field | Enter apply | d clear | Esc cancel",
+            "Tab/Up/Down switch field | Enter apply | d clear APR | Esc cancel",
             Style::default().fg(Color::DarkGray),
         ),
     ];
@@ -308,7 +336,7 @@ fn render_row_rate_popup(frame: &mut Frame, app: &App) {
     let popup = Paragraph::new(Text::from(popup_lines))
         .block(
             Block::default()
-                .title(" APR Override For Selected Row ")
+                .title(" Row Editor ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         )
@@ -327,30 +355,14 @@ fn summary_lines(metrics: &LoanMetrics) -> Vec<Line<'static>> {
     };
 
     vec![
-        Line::from(format!(
-            "First Monthly Payment:            {}",
-            money(metrics.first_monthly_payment_base)
-        )),
-        Line::from(format!(
-            "Selected Month:                   M{}",
-            metrics.selected_month
-        )),
-        Line::from(format!(
-            "Selected Month APR:               {:.3}%",
-            metrics.selected_month_effective_rate_pct
-        )),
-        Line::from(format!(
-            "Payment at Selected Month:        {}",
-            money(metrics.selected_monthly_payment_base)
-        )),
-        Line::from(format!(
-            "Effective Monthly (+fees):        {}",
-            money(metrics.selected_monthly_payment_with_fees)
-        )),
         Line::from(format!("Next Change:                      {}", next_change)),
         Line::from(format!(
             "Total Interest:                   {}",
             money(metrics.total_interest)
+        )),
+        Line::from(format!(
+            "Total Extra Payments:             {}",
+            money(metrics.total_extra_payments)
         )),
         Line::from(format!(
             "Total Repayment:                  {}",
